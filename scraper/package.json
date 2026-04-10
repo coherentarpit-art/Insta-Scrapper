@@ -1,0 +1,22 @@
+{
+  "name": "scraper",
+  "version": "1.0.0",
+  "description": "",
+  "main": "crawler.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@bull-board/api": "^6.21.0",
+    "@bull-board/express": "^6.21.0",
+    "bullmq": "^5.71.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "ioredis": "^5.10.1",
+    "mongoose": "^9.3.2"
+  }
+}

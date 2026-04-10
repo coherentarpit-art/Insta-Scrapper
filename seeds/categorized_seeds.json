@@ -1,0 +1,30 @@
+{
+  "categories": {
+    "Fitness": ["rajat_9629", "saketgokhale", "abhinavmahajanlife"],
+    "Gaming": ["mythpat"],
+    "Cars": ["rachit.hirani", "arunpanwarx"],
+    "Bikes": ["mumbiker_nikhil", "jsfilmsindia"],
+    "Tech": ["techburner"],
+    "Coding": ["hiteshchoudharyofficial"],
+    "Finance": ["pranjalkamra"],
+    "Trading": ["rachanarandane", "prsundar64"],
+    "Education": ["mohakmangal"],
+    "Motivation": ["rajshamani"],
+    "Comedy": [],
+    "ShortContent": ["justsul"],
+    "Podcast": ["beerbiceps"],
+    "Fashion": ["komalpandeyofficial", "thatbohogirl"],
+    "Beauty": ["malvikasitlaniofficial", "debasreee"],
+    "Skincare": ["nikhilchamoli", "ashortnote"],
+    "Cooking": ["kabitaskitchen", "yourfoodlab"],
+    "StreetFood": ["dilsefoodie", "foodie_incarnate"],
+    "Travel": ["tanyakhanijow", "varunvagish"],
+    "HomeDecor": ["interiorbydesign_ig", "livspace"],
+    "Spiritual": ["gaurgopaldas", "acharyaprashant"],
+    "Pets": ["dogsofmumbai", "thepetcollectiveindia"],
+    "Photography": ["indiapictures", "shutterhubindia"],
+    "Art": ["rjartworks", "artbypriya_04"],
+    "DIY": ["craftysisters", "diywithkp"],
+    "Entrepreneurship": ["varungandhi80"]
+  }
+}
