@@ -12,14 +12,22 @@
  *   node scrape.js <username> <count>  # scrape specific count of posts
  */
 
+require('dotenv').config();
+
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const querystring = require('querystring');
 const { MongoClient } = require('mongodb');
 
-const mongoUri = 'mongodb://localhost:27017'; // Replace with your MongoDB connection string
-const client = new MongoClient(mongoUri);
+const MONGO_URI = process.env.MONGO_URI;
+const MONGO_DB = process.env.MONGO_DB || 'coherent2026_db';
+const MONGO_COLLECTION = process.env.MONGO_COLLECTION || 'insta_Profiles';
+
+if (!MONGO_URI) {
+  console.error('ERROR: MONGO_URI is not set in .env');
+  process.exit(1);
+}
 
 // ---------- CONFIGURATION ----------
 // These values come from your logged-in Instagram browser session.
@@ -289,7 +297,7 @@ function parsePostNode(node, followers) {
     }),
     likes: likeCount,
     comments: commentCount,
-    views: node.view_count || 0,
+    views: node.view_count || node.play_count || node.ig_play_count || node.video_view_count || 0,
     fb_likes: node.fb_like_count || 0,
     post_type: postType,
     media_type: node.media_type,
@@ -426,22 +434,46 @@ async function scrapeInstagram(username, maxPosts = 50) {
 }
 
 async function storeScrapedData(data) {
+  const client = new MongoClient(MONGO_URI);
   try {
     console.log('Connecting to MongoDB...');
     await client.connect();
     console.log('Connected to MongoDB.');
 
-    const database = client.db('instascraper'); // Replace with your database name
-    const collection = database.collection('scraped_profiles');
+    const database = client.db(MONGO_DB);
+    const collection = database.collection(MONGO_COLLECTION);
 
-    console.log(`Inserting scraped data: ${JSON.stringify(data)}`);
-    await collection.insertOne(data);
+    await collection.updateOne(
+      { username: data.username },
+      { $set: data },
+      { upsert: true }
+    );
     console.log(`Stored scraped data in MongoDB: @${data.username}`);
   } catch (err) {
     console.error('Failed to store scraped data in MongoDB:', err.message);
   } finally {
     await client.close();
     console.log('MongoDB connection closed.');
+  }
+}
+
+async function storeSkippedProfile(data) {
+  const client = new MongoClient(MONGO_URI);
+  try {
+    await client.connect();
+    const database = client.db(MONGO_DB);
+    const collection = database.collection('skipped_profiles');
+
+    await collection.updateOne(
+      { username: data.username },
+      { $set: { ...data, skippedAt: new Date().toISOString() } },
+      { upsert: true }
+    );
+    console.log(`Recorded skipped profile: @${data.username} — ${data.reason}`);
+  } catch (err) {
+    console.error('Failed to store skipped profile in MongoDB:', err.message);
+  } finally {
+    await client.close();
   }
 }
 
