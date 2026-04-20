@@ -34,6 +34,9 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { Queue } = require('bullmq');
 const Redis = require('ioredis');
 
+// Import MongoDB
+const { MongoClient } = require('mongodb');
+
 // Initialize Redis connection using .env credentials
 const redisConnection = new Redis({
   host: process.env.REDIS_HOST,
@@ -508,6 +511,20 @@ function parsePost(node, followers) {
 
   const likeCount = node.like_count || 0;
   const commentCount = node.comment_count || 0;
+  
+  // Try all possible view count fields
+  let viewCount = 0;
+  if (node.view_count) viewCount = node.view_count;
+  else if (node.play_count) viewCount = node.play_count;
+  else if (node.video_view_count) viewCount = node.video_view_count;
+  else if (node.ig_play_count) viewCount = node.ig_play_count;
+  else if (node.views) viewCount = node.views;
+  
+  // Debug: log if we find views
+  if (viewCount > 0) {
+    log(`  [DEBUG] Found views: ${viewCount} for post ${node.code}`);
+  }
+  
   const engagementRate = followers > 0
     ? parseFloat(((likeCount + commentCount) / followers * 100).toFixed(4))
     : 0;
@@ -523,7 +540,7 @@ function parsePost(node, followers) {
     }),
     likes: likeCount,
     comments: commentCount,
-    views: node.view_count || node.play_count || 0,
+    views: viewCount,
     fb_likes: node.fb_like_count || 0,
     post_type: node.product_type === 'clips' ? 'Reel' : 'Post',
     media_type: node.media_type,
@@ -580,6 +597,30 @@ function computeMetrics(posts, followers) {
     posts_with_mentions: posts.filter(p => p.has_mentions).length,
     post_types: postTypes,
   };
+}
+
+// =============================================
+// MONGODB SAVE FUNCTION
+// =============================================
+
+async function saveToMongoDB(result) {
+  const client = new MongoClient(process.env.MONGO_URI);
+  try {
+    await client.connect();
+    const db = client.db(process.env.MONGO_DB || 'coherent2026_db');
+    const collection = db.collection(process.env.MONGO_COLLECTION || 'insta_Profiles');
+    
+    await collection.updateOne(
+      { username: result.data.username },
+      { $set: result },
+      { upsert: true }
+    );
+    log(`  ✓ Saved to MongoDB: @${result.data.username}`);
+  } catch (err) {
+    log(`  ✗ MongoDB error: ${err.message}`);
+  } finally {
+    await client.close();
+  }
 }
 
 // =============================================
@@ -690,6 +731,9 @@ async function scrapeFullProfile(username, depth, source) {
   fs.writeFileSync(allFile, JSON.stringify(existing, null, 2));
 
   log(`  Saved @${username} → ${parsedPosts.length} posts, ${metrics?.engagement_rate || 0}% engagement (total: ${existing.total_profiles})`);
+
+  // Save to MongoDB
+  await saveToMongoDB(result);
 
   state.scraped.add(username);
   state.stats.profilesScraped++;

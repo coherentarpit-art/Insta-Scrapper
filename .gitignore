@@ -4,3 +4,11 @@ scraper/configs/
 backend/all_profiles.json
 backend/skipped_profiles.json
 backend/data/
+# Generated / local exports (do not commit large dumps)
+backend/today_scraped.json
+backend/mongo_export.json
+backend/queued_usernames.json
+backend/queued_usernames.txt
+backend/queue_pruned_usernames.json
+backend/.txt
+.claude/

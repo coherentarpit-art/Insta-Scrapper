@@ -36,11 +36,54 @@ const vpn = require('./vpn');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const CONFIG = {
-  cookies: process.env.IG_COOKIES,
-  csrfToken: process.env.IG_CSRF_TOKEN,
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
   igAppId: process.env.IG_APP_ID || '936619743392459',
 };
+
+// =============================================
+// ACCOUNT POOL — round-robin multi-account
+// =============================================
+
+function loadAccounts() {
+  const accounts = [];
+  // Load numbered accounts IG_ACC1_COOKIES ... IG_ACC10_COOKIES
+  for (let i = 1; i <= 10; i++) {
+    const cookies = process.env[`IG_ACC${i}_COOKIES`];
+    const csrf    = process.env[`IG_ACC${i}_CSRF`];
+    if (cookies && csrf && !cookies.includes('REPLACE_ME')) {
+      accounts.push({ id: i, cookies, csrf, coolUntil: 0 });
+    }
+  }
+  // Legacy single-account fallback (IG_COOKIES / IG_CSRF_TOKEN)
+  if (accounts.length === 0 && process.env.IG_COOKIES) {
+    accounts.push({ id: 0, cookies: process.env.IG_COOKIES, csrf: process.env.IG_CSRF_TOKEN, coolUntil: 0 });
+  }
+  return accounts;
+}
+
+const ACCOUNTS = loadAccounts();
+let _accountIdx = 0;
+
+function getAccount() {
+  const now = Date.now();
+  // Try up to ACCOUNTS.length times to find one not in cooldown
+  for (let attempt = 0; attempt < ACCOUNTS.length; attempt++) {
+    const acc = ACCOUNTS[_accountIdx % ACCOUNTS.length];
+    _accountIdx++;
+    if (acc.coolUntil <= now) return acc;
+  }
+  // All in cooldown — return the one whose cooldown expires soonest
+  return ACCOUNTS.reduce((a, b) => a.coolUntil < b.coolUntil ? a : b);
+}
+
+function markAccountRateLimited(acc, reason = 'rate') {
+  acc.coolUntil = Date.now() + 10 * 60 * 1000; // 10-min cooldown
+  if (reason === 'login') {
+    log(`  Account #${acc.id} session rejected (HTTP_302 → login) — cooldown 10 min; refresh IG_ACC cookies + CSRF in .env`);
+  } else {
+    log(`  Account #${acc.id} rate-limited — cooling down 10 min`);
+  }
+}
 
 const LIMITS = {
   minFollowers: 5000,
@@ -120,6 +163,13 @@ const profileSchema = new mongoose.Schema({
 const collectionName = process.env.MONGO_COLLECTION || 'insta_Profiles';
 const Profile = mongoose.model('Profile', profileSchema, collectionName);
 
+const newCollectionName = (process.env.MONGO_COLLECTION_NEW || '').trim();
+const ProfileNew =
+  newCollectionName && newCollectionName !== collectionName
+    ? mongoose.models.ProfileNewInsta ||
+      mongoose.model('ProfileNewInsta', profileSchema, newCollectionName)
+    : null;
+
 async function connectMongo() {
   const uri = process.env.MONGO_URI;
   if (!uri) {
@@ -128,7 +178,11 @@ async function connectMongo() {
   }
   try {
     await mongoose.connect(uri, { dbName: process.env.MONGO_DB || 'coherent2026_db' });
-    log(`Connected to MongoDB (collection: ${collectionName})`);
+    log(
+      `Connected to MongoDB (collection: ${collectionName}` +
+        (ProfileNew ? ` + ${newCollectionName}` : '') +
+        ')'
+    );
     return true;
   } catch (err) {
     log(`MongoDB connection failed: ${err.message}`);
@@ -174,8 +228,61 @@ async function saveToMongo(result) {
       result,
       { upsert: true, returnDocument: 'after' }
     );
+    if (ProfileNew) {
+      await ProfileNew.findOneAndUpdate(
+        { 'data.username': result.data.username },
+        result,
+        { upsert: true, returnDocument: 'after' }
+      );
+    }
   } catch (err) {
     log(`  MongoDB save failed for @${result.data.username}: ${err.message}`);
+  }
+}
+
+function appendToTodayFile(result) {
+  try {
+    const TODAY_FILE = path.join(__dirname, '..', 'backend', 'today_scraped.json');
+    const todayStr = new Date().toISOString().slice(0, 10);
+
+    let profiles = [];
+    if (fs.existsSync(TODAY_FILE)) {
+      try {
+        const raw = fs.readFileSync(TODAY_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        // Reset if file is from a previous day
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]._exportDate !== todayStr) {
+          profiles = [];
+        } else {
+          profiles = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (_) { profiles = []; }
+    }
+
+    const entry = {
+      _exportDate: todayStr,
+      username: result.data?.username,
+      full_name: result.data?.full_name,
+      pk: result.data?.pk,
+      followers: result.data?.followers,
+      following: result.data?.following,
+      our_category: result.data?.our_category || result.crawl_info?.our_category,
+      scraped_at: result.scraped_at || new Date().toISOString(),
+      crawl_info: result.crawl_info,
+      data: result.data,
+      engagement_metrics: result.engagement_metrics,
+      post_types: result.data?.post_types,
+      recent_posts: result.recent_posts,
+    };
+
+    // Upsert by username
+    const idx = profiles.findIndex(p => p.username === entry.username);
+    if (idx >= 0) profiles[idx] = entry;
+    else profiles.push(entry);
+
+    fs.writeFileSync(TODAY_FILE, JSON.stringify(profiles, null, 2), 'utf8');
+  } catch (err) {
+    // Non-fatal — don't crash scraper over file write
   }
 }
 
@@ -215,7 +322,8 @@ function parseMetaCount(str) {
 // HTTP
 // =============================================
 
-function httpGet(url, extraHeaders = {}) {
+function httpGet(url, extraHeaders = {}, acc = null) {
+  const account = acc || getAccount();
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const options = {
@@ -225,7 +333,7 @@ function httpGet(url, extraHeaders = {}) {
       headers: {
         'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'accept-language': 'en-US,en;q=0.9',
-        'cookie': CONFIG.cookies,
+        'cookie': account.cookies,
         'user-agent': CONFIG.userAgent,
         'sec-fetch-mode': 'navigate',
         ...extraHeaders,
@@ -241,7 +349,8 @@ function httpGet(url, extraHeaders = {}) {
   });
 }
 
-function httpGetJson(url, extraHeaders = {}) {
+function httpGetJson(url, extraHeaders = {}, acc = null) {
+  const account = acc || getAccount();
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const options = {
@@ -251,9 +360,9 @@ function httpGetJson(url, extraHeaders = {}) {
       headers: {
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9',
-        'cookie': CONFIG.cookies,
+        'cookie': account.cookies,
         'user-agent': CONFIG.userAgent,
-        'x-csrftoken': CONFIG.csrfToken,
+        'x-csrftoken': account.csrf,
         'x-ig-app-id': CONFIG.igAppId,
         'x-ig-www-claim': 'hmac.AR0si6YYQcCivXubfm_ml_WZ_kREfaxkrMM2Q2UsZFtgRW5R',
         'x-requested-with': 'XMLHttpRequest',
@@ -283,8 +392,8 @@ function httpGetJson(url, extraHeaders = {}) {
 // INSTAGRAM FUNCTIONS
 // =============================================
 
-async function scrapeProfile(username) {
-  const response = await httpGet(`https://www.instagram.com/${username}/`);
+async function scrapeProfile(username, acc) {
+  const response = await httpGet(`https://www.instagram.com/${username}/`, {}, acc);
   if (response.status === 404) return null;
   if (response.status === 429) throw new Error('RATE_LIMITED');
   if (response.status !== 200) throw new Error(`HTTP_${response.status}`);
@@ -361,11 +470,11 @@ async function scrapeProfile(username) {
   return profile;
 }
 
-async function fetchUserInfo(pk) {
+async function fetchUserInfo(pk, acc) {
   const url = `https://i.instagram.com/api/v1/users/${pk}/info/`;
   const json = await httpGetJson(url, {
     'user-agent': 'Instagram 317.0.0.34.109 Android (30/11; 420dpi; 1080x2220; Google; Pixel 5; redfin; redfin; en_US; 562804463)',
-  });
+  }, acc);
   const u = json?.user;
   if (!u) return null;
   return {
@@ -383,15 +492,16 @@ async function fetchUserInfo(pk) {
   };
 }
 
-async function getSuggestedUsers(userId) {
+async function getSuggestedUsers(userId, acc) {
   const url = `https://i.instagram.com/api/v1/discover/chaining/?target_id=${userId}`;
   const json = await httpGetJson(url, {
     'user-agent': 'Instagram 317.0.0.34.109 Android (30/11; 420dpi; 1080x2220; Google; Pixel 5; redfin; redfin; en_US; 562804463)',
-  });
+  }, acc);
   return json?.users || [];
 }
 
 function httpPostGraphQL(body) {
+  const acc = getAccount();
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'www.instagram.com',
@@ -403,11 +513,11 @@ function httpPostGraphQL(body) {
         'accept-encoding': 'identity',
         'content-type': 'application/x-www-form-urlencoded',
         'content-length': Buffer.byteLength(body),
-        'cookie': CONFIG.cookies,
+        'cookie': acc.cookies,
         'user-agent': CONFIG.userAgent,
         'origin': 'https://www.instagram.com',
         'referer': 'https://www.instagram.com/',
-        'x-csrftoken': CONFIG.csrfToken,
+        'x-csrftoken': acc.csrf,
         'x-fb-lsd': process.env.IG_LSD,
         'x-ig-app-id': CONFIG.igAppId,
       },
@@ -592,6 +702,16 @@ async function processJob(job) {
   jobCount++;
   profilesSinceRotate++;
 
+  // Pick one account for this entire job (consistent per profile)
+  const acc = getAccount();
+  // With a single account, getAccount() still returns it while coolUntil is in the
+  // future — wait so we do not hammer Instagram with doomed 302s every few seconds.
+  if (acc.coolUntil > Date.now()) {
+    const waitMs = acc.coolUntil - Date.now() + 1500;
+    log(`  Account #${acc.id} in cooldown — waiting ${Math.ceil(waitMs / 1000)}s...`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+
   // Resolve our_category: from job data, else inherit from source via Redis hash
   let ourCategory = job.data.our_category || '';
   if (!ourCategory && source) {
@@ -623,19 +743,17 @@ async function processJob(job) {
   // Step 1: Scrape profile
   let profile;
   try {
-    profile = await scrapeProfile(username);
+    profile = await scrapeProfile(username, acc);
   } catch (err) {
     if (err.message === 'RATE_LIMITED') {
-      log(`  Rate limited! Rotating VPN + waiting...`);
-      await vpn.rotate('rate_limited');
-      profilesSinceRotate = 0;
+      markAccountRateLimited(acc);
+      log(`  Rate limited! Waiting for another account...`);
       await randomDelay(DELAYS.onRateLimit);
       throw err; // BullMQ will retry
     }
     if (err.message === 'HTTP_302') {
-      log(`  Login redirect! Rotating VPN...`);
-      await vpn.rotate('login_redirect');
-      profilesSinceRotate = 0;
+      log(`  Login redirect on account #${acc.id}!`);
+      markAccountRateLimited(acc, 'login');
       throw err;
     }
     throw err;
@@ -669,7 +787,7 @@ async function processJob(job) {
     const CELEB_CAP = 1500000;
     if (depth === 0 && profile.pk && followers <= CELEB_CAP) {
       try {
-        const suggested = await getSuggestedUsers(profile.pk);
+        const suggested = await getSuggestedUsers(profile.pk, acc);
         let newCount = 0;
         for (const user of suggested) {
           if (user.is_private) continue;
@@ -735,7 +853,7 @@ async function processJob(job) {
   if (profile.pk) {
     try {
       await randomDelay([1000, 2000]);
-      userInfo = await fetchUserInfo(profile.pk) || {};
+      userInfo = await fetchUserInfo(profile.pk, acc) || {};
     } catch (err) {
       log(`  User info failed for @${username}: ${err.message}`);
     }
@@ -767,8 +885,9 @@ async function processJob(job) {
     },
   };
 
-  // Save to MongoDB only
+  // Save to MongoDB and local today_scraped.json
   await saveToMongo(result);
+  appendToTodayFile(result);
 
   // Mark as scraped in Redis
   await redis.sadd(SCRAPED_KEY, username);
@@ -780,7 +899,7 @@ async function processJob(job) {
   if (depth < LIMITS.maxDepth && profile.pk) {
     await randomDelay(DELAYS.afterSuggestions);
     try {
-      const suggested = await getSuggestedUsers(profile.pk);
+      const suggested = await getSuggestedUsers(profile.pk, acc);
       let newCount = 0;
 
       for (const user of suggested) {
@@ -913,7 +1032,12 @@ async function seedQueue(seedFile) {
 }
 
 async function startWorker(concurrency = 1) {
-  log(`Starting worker (concurrency: ${concurrency})...`);
+  log(`Starting worker (concurrency: ${concurrency}, accounts: ${ACCOUNTS.length})...`);
+  if (ACCOUNTS.length === 0) {
+    log('ERROR: No Instagram accounts found! Add IG_ACC1_COOKIES and IG_ACC1_CSRF to .env');
+    process.exit(1);
+  }
+  ACCOUNTS.forEach(a => log(`  Account #${a.id} loaded`))
 
   const worker = new Worker('scrape', processJob, {
     connection: redisConnection,
@@ -1028,6 +1152,19 @@ async function main() {
     case 'start': {
       const concIdx = args.indexOf('--concurrency');
       const concurrency = concIdx >= 0 ? parseInt(args[concIdx + 1]) || 1 : 1;
+      // --account N  pins this process to a specific account (used by worker.js)
+      const accIdx = args.indexOf('--account');
+      if (accIdx >= 0) {
+        const accNum = parseInt(args[accIdx + 1]);
+        const found = ACCOUNTS.find(a => a.id === accNum);
+        if (!found) {
+          log(`Account #${accNum} not found in .env — check IG_ACC${accNum}_COOKIES`);
+          process.exit(1);
+        }
+        ACCOUNTS.length = 0;
+        ACCOUNTS.push(found);
+        log(`Pinned to Account #${accNum}`);
+      }
       await startWorker(concurrency);
       // Keep process alive
       await new Promise(() => {});
