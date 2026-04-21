@@ -1,0 +1,3 @@
+# Optional: pip install -r requirements-instaloader.txt
+# Then set USE_INSTALOADER=1 in scraper/.env and/or backend/.env
+instaloader>=4.12

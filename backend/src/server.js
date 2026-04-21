@@ -1,8 +1,8 @@
 /**
  * Backend API Server
  *
- * Serves pre-scraped influencer data from JSON files.
- * No scraping happens here — data is produced by the scraper (../scraper/).
+ * Profile data: MongoDB first (same store as queue-crawler), else JSON in ../data/.
+ * No scraping here — refresh data by re-running the scraper / queue worker.
  */
 
 const express = require('express');
@@ -10,6 +10,9 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const mongoose = require('mongoose');
+
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -17,6 +20,32 @@ const DATA_DIR = path.join(__dirname, '..', 'data');
 
 app.use(cors());
 app.use(express.json());
+
+// ---------- MONGODB (optional) ----------
+
+const MONGO_COLLECTION = process.env.MONGO_COLLECTION || 'insta_Profiles';
+const profileSchema = new mongoose.Schema({}, { strict: false, collection: MONGO_COLLECTION });
+const Profile =
+  mongoose.models.ProfileApiDoc || mongoose.model('ProfileApiDoc', profileSchema);
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function loadProfileFromMongo(username) {
+  if (mongoose.connection.readyState !== 1) return null;
+  const u = String(username || '').trim().replace(/^@/, '');
+  if (!u) return null;
+  try {
+    const doc = await Profile.findOne({
+      'data.username': new RegExp(`^${escapeRegex(u)}$`, 'i'),
+    }).lean();
+    return doc && doc.data ? doc : null;
+  } catch (err) {
+    console.warn('Mongo profile lookup:', err.message);
+    return null;
+  }
+}
 
 // ---------- HELPERS ----------
 
@@ -27,6 +56,16 @@ function loadProfileData(username) {
   }
   const raw = fs.readFileSync(filePath, 'utf8');
   return JSON.parse(raw);
+}
+
+/** Same shape as Mongo: full document with .data and .scraped_at */
+async function resolveProfileDocument(username) {
+  const u = String(username || '').trim().replace(/^@/, '');
+  if (!u) return null;
+  const fromMongo = await loadProfileFromMongo(u);
+  if (fromMongo) return fromMongo;
+  const fromFile = loadProfileData(u) || loadProfileData(u.toLowerCase());
+  return fromFile;
 }
 
 function computeMedian(arr) {
@@ -147,28 +186,11 @@ function computePartnershipDetails(posts, influencerUsername) {
     .sort((a, b) => b.post_count - a.post_count || b.avg_engagement - a.avg_engagement);
 }
 
-// ---------- ROUTES ----------
-
-/**
- * GET /api/profile/:username
- * Returns profile info + engagement metrics (without posts)
- */
-app.get('/api/profile/:username', (req, res) => {
-  const { username } = req.params;
-  const scraped = loadProfileData(username);
-
-  if (!scraped || !scraped.data) {
-    return res.status(404).json({
-      error: 'Profile not found',
-      message: `No data available for @${username}. Run the scraper first.`,
-    });
-  }
-
+function buildProfileApiPayload(scraped, options = {}) {
   const data = scraped.data;
   const posts = data.recent_posts || [];
   const metrics = data.engagement_metrics || {};
-
-  res.json({
+  const payload = {
     username: data.username,
     full_name: data.full_name,
     profile_pic: data.profile_pic,
@@ -179,10 +201,12 @@ app.get('/api/profile/:username', (req, res) => {
     bio: data.bio || '',
     engagement_metrics: {
       ...metrics,
-      median_likes: computeMedian(posts.map(p => p.likes || 0)),
-      median_comments: computeMedian(posts.map(p => p.comments || 0)),
-      median_engagements: computeMedian(posts.map(p => (p.likes || 0) + (p.comments || 0))),
-      median_engagement_rate: computeMedian(posts.filter(p => p.engagement_rate > 0).map(p => p.engagement_rate)),
+      median_likes: computeMedian(posts.map((p) => p.likes || 0)),
+      median_comments: computeMedian(posts.map((p) => p.comments || 0)),
+      median_engagements: computeMedian(posts.map((p) => (p.likes || 0) + (p.comments || 0))),
+      median_engagement_rate: computeMedian(
+        posts.filter((p) => p.engagement_rate > 0).map((p) => p.engagement_rate)
+      ),
     },
     post_types: data.post_types,
     monthly_stats: computeMonthlyStats(posts),
@@ -190,7 +214,72 @@ app.get('/api/profile/:username', (req, res) => {
     scraped_at: scraped.scraped_at,
     methods: scraped.methods || [],
     total_posts_available: posts.length,
-  });
+  };
+  if (options.includeRecentPosts) payload.recent_posts = posts;
+  return payload;
+}
+
+// ---------- ROUTES ----------
+
+/**
+ * GET /api/profile/:username/live
+ * Fetches current followers / post likes from Instagram (uses IG_* cookies in backend/.env).
+ * Does not write MongoDB. Register before /api/profile/:username.
+ */
+app.get('/api/profile/:username/live', async (req, res) => {
+  const livePath = path.join(__dirname, '..', '..', 'scraper', 'live-profile-fetch.js');
+  let fetchLive;
+  try {
+    fetchLive = require(livePath);
+  } catch (err) {
+    return res.status(500).json({ error: 'live_module', message: err.message });
+  }
+  try {
+    const scraped = await fetchLive.fetchLiveAsScrapedDoc(req.params.username, { maxPosts: 12 });
+    if (!scraped) {
+      return res.status(404).json({ error: 'Profile not found', message: 'Instagram returned no profile.' });
+    }
+    if (scraped._private) {
+      return res.status(403).json({ error: 'private', message: 'This account is private.' });
+    }
+    const payload = buildProfileApiPayload(scraped, { includeRecentPosts: true });
+    payload.data_source = 'instagram_live';
+    return res.json(payload);
+  } catch (err) {
+    const code = err.message;
+    const status =
+      code === 'RATE_LIMITED' ? 429 : code === 'AUTH_ERROR' ? 401 : code.startsWith('HTTP_') ? 502 : 502;
+    return res.status(status).json({
+      error: code,
+      message:
+        code === 'AUTH_ERROR'
+          ? 'Invalid or expired Instagram session — refresh IG_ACC* cookies in backend/.env'
+          : err.message,
+    });
+  }
+});
+
+/**
+ * GET /api/profile/:username
+ * Returns profile info + engagement metrics (Mongo / JSON, not live Instagram)
+ */
+app.get('/api/profile/:username', async (req, res) => {
+  const { username } = req.params;
+  let scraped;
+  try {
+    scraped = await resolveProfileDocument(username);
+  } catch (err) {
+    return res.status(500).json({ error: 'Lookup failed', message: err.message });
+  }
+
+  if (!scraped || !scraped.data) {
+    return res.status(404).json({
+      error: 'Profile not found',
+      message: `No data for @${username}. Scrape them first (queue worker) or add backend/.env MONGO_URI.`,
+    });
+  }
+
+  res.json({ ...buildProfileApiPayload(scraped), data_source: 'database' });
 });
 
 /**
@@ -202,13 +291,18 @@ app.get('/api/profile/:username', (req, res) => {
  *   size   - posts per page (default 8)
  *   offset - starting index (default 0)
  */
-app.get('/api/profile/:username/posts', (req, res) => {
+app.get('/api/profile/:username/posts', async (req, res) => {
   const { username } = req.params;
   const sort = req.query.sort || 'date';
   const size = Math.min(parseInt(req.query.size) || 8, 50);
   const offset = parseInt(req.query.offset) || 0;
 
-  const scraped = loadProfileData(username);
+  let scraped;
+  try {
+    scraped = await resolveProfileDocument(username);
+  } catch (err) {
+    return res.status(500).json({ error: 'Lookup failed', message: err.message });
+  }
 
   if (!scraped || !scraped.data) {
     return res.status(404).json({
@@ -314,13 +408,31 @@ app.get('/api/image-proxy', (req, res) => {
 
 // ---------- START ----------
 
-app.listen(PORT, () => {
-  console.log(`\n  Backend API running on http://localhost:${PORT}`);
-  console.log(`  Data directory: ${DATA_DIR}\n`);
-  console.log('  Endpoints:');
-  console.log('    GET /api/profiles                     - List all profiles');
-  console.log('    GET /api/profile/:username             - Profile info + metrics');
+async function start() {
+  if (process.env.MONGO_URI) {
+    try {
+      await mongoose.connect(process.env.MONGO_URI, {
+        dbName: process.env.MONGO_DB || 'coherent2026_db',
+      });
+      console.log(`  MongoDB: connected (${MONGO_COLLECTION})`);
+    } catch (err) {
+      console.warn(`  MongoDB: not connected (${err.message}) — using JSON files only`);
+    }
+  } else {
+    console.log('  MongoDB: MONGO_URI not set — using JSON files only');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`\n  Backend API running on http://localhost:${PORT}`);
+    console.log(`  Data directory: ${DATA_DIR}\n`);
+    console.log('  Endpoints:');
+    console.log('    GET /api/profiles                     - List all profiles');
+  console.log('    GET /api/profile/:username/live        - Live Instagram (cookies in .env; no DB write)');
+  console.log('    GET /api/profile/:username             - Profile info + metrics (Mongo / JSON)');
   console.log('    GET /api/profile/:username/posts       - Paginated posts');
-  console.log('        ?sort=date|likes|comments');
-  console.log('        &size=8&offset=0\n');
-});
+    console.log('        ?sort=date|likes|comments');
+    console.log('        &size=8&offset=0\n');
+  });
+}
+
+start();

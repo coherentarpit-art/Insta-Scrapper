@@ -35,9 +35,16 @@ const vpn = require('./vpn');
 
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
+const { httpGet: igHttpGet, httpGetJson: igHttpGetJson, IG_CONFIG } = require('./ig-request');
+const instaloaderBridge = require('./instaloader-bridge');
+
 const CONFIG = {
-  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
-  igAppId: process.env.IG_APP_ID || '936619743392459',
+  get userAgent() {
+    return IG_CONFIG.userAgent;
+  },
+  get igAppId() {
+    return IG_CONFIG.igAppId;
+  },
 };
 
 // =============================================
@@ -88,9 +95,7 @@ function markAccountRateLimited(acc, reason = 'rate') {
 const LIMITS = {
   minFollowers: 5000,
   maxFollowers: 200000,
-  maxPostsSmall: 12,       // 5K-100K followers → 12 posts
-  maxPostsLarge: 50,       // 100K-200K followers → 50 posts
-  followerThreshold: 100000, // boundary between small and large
+  maxPostsPerProfile: 50,
   maxDepth: 4,
 };
 
@@ -324,68 +329,12 @@ function parseMetaCount(str) {
 
 function httpGet(url, extraHeaders = {}, acc = null) {
   const account = acc || getAccount();
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9',
-        'cookie': account.cookies,
-        'user-agent': CONFIG.userAgent,
-        'sec-fetch-mode': 'navigate',
-        ...extraHeaders,
-      },
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
-    });
-    req.on('error', reject);
-    req.end();
-  });
+  return igHttpGet(url, extraHeaders, account);
 }
 
 function httpGetJson(url, extraHeaders = {}, acc = null) {
   const account = acc || getAccount();
-  return new Promise((resolve, reject) => {
-    const urlObj = new URL(url);
-    const options = {
-      hostname: urlObj.hostname,
-      path: urlObj.pathname + urlObj.search,
-      method: 'GET',
-      headers: {
-        'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        'cookie': account.cookies,
-        'user-agent': CONFIG.userAgent,
-        'x-csrftoken': account.csrf,
-        'x-ig-app-id': CONFIG.igAppId,
-        'x-ig-www-claim': 'hmac.AR0si6YYQcCivXubfm_ml_WZ_kREfaxkrMM2Q2UsZFtgRW5R',
-        'x-requested-with': 'XMLHttpRequest',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'referer': 'https://www.instagram.com/',
-        ...extraHeaders,
-      },
-    };
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 429) return reject(new Error('RATE_LIMITED'));
-        if (res.statusCode === 401 || res.statusCode === 403) return reject(new Error('AUTH_ERROR'));
-        if (res.statusCode !== 200) return reject(new Error(`HTTP_${res.statusCode}`));
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('JSON_PARSE_ERROR')); }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
+  return igHttpGetJson(url, extraHeaders, account);
 }
 
 // =============================================
@@ -565,8 +514,10 @@ function buildPostsPayload(username, cursor = null) {
   });
 }
 
-async function fetchUserPosts(username, maxPosts = 50) {
+async function fetchUserPosts(username, maxPosts = 50, acc = null) {
   // Use the simple REST feed endpoint (same as crawler.js) — no GraphQL/lsd tokens needed
+  const account = acc || getAccount();
+  const profileReferer = `https://www.instagram.com/${encodeURIComponent(username)}/`;
   const allPosts = [];
   let maxId = null;
   let pages = 0;
@@ -576,7 +527,7 @@ async function fetchUserPosts(username, maxPosts = 50) {
     let url = `https://www.instagram.com/api/v1/feed/user/${username}/username/?count=12`;
     if (maxId) url += `&max_id=${maxId}`;
 
-    const json = await httpGetJson(url);
+    const json = await httpGetJson(url, { referer: profileReferer }, account);
     const items = json?.items || [];
     if (items.length === 0) break;
 
@@ -740,23 +691,43 @@ async function processJob(job) {
     global._nextCooldownAt = jobCount + Math.floor(DELAYS.cooldownEvery[0] + Math.random() * (DELAYS.cooldownEvery[1] - DELAYS.cooldownEvery[0]));
   }
 
-  // Step 1: Scrape profile
+  // Step 1: Scrape profile (optional Instaloader — Python, real-time IG data)
   let profile;
-  try {
-    profile = await scrapeProfile(username, acc);
-  } catch (err) {
-    if (err.message === 'RATE_LIMITED') {
-      markAccountRateLimited(acc);
-      log(`  Rate limited! Waiting for another account...`);
-      await randomDelay(DELAYS.onRateLimit);
-      throw err; // BullMQ will retry
+  let rawPostsFromInstaloader = null;
+  if (instaloaderBridge.isInstaloaderEnabled()) {
+    const pack = await instaloaderBridge.fetchInstaloaderProfileAndPosts(
+      username,
+      LIMITS.maxPostsPerProfile
+    );
+    if (pack) {
+      profile = pack.profile;
+      rawPostsFromInstaloader = pack.items || [];
+      if (rawPostsFromInstaloader.length > 0) {
+        log(`  Instaloader: @${username} (${rawPostsFromInstaloader.length} posts)`);
+      } else {
+        log(`  Instaloader: @${username} profile only (0 posts) — fetching posts via HTTP`);
+        rawPostsFromInstaloader = null;
+      }
     }
-    if (err.message === 'HTTP_302') {
-      log(`  Login redirect on account #${acc.id}!`);
-      markAccountRateLimited(acc, 'login');
+  }
+
+  if (!profile) {
+    try {
+      profile = await scrapeProfile(username, acc);
+    } catch (err) {
+      if (err.message === 'RATE_LIMITED') {
+        markAccountRateLimited(acc);
+        log(`  Rate limited! Waiting for another account...`);
+        await randomDelay(DELAYS.onRateLimit);
+        throw err; // BullMQ will retry
+      }
+      if (err.message === 'HTTP_302') {
+        log(`  Login redirect on account #${acc.id}!`);
+        markAccountRateLimited(acc, 'login');
+        throw err;
+      }
       throw err;
     }
-    throw err;
   }
 
   if (!profile) {
@@ -819,22 +790,26 @@ async function processJob(job) {
 
   log(`  @${username}: ${followers.toLocaleString()} followers`);
 
-  // Step 2: Fetch posts (with retry on 302)
-  await randomDelay(DELAYS.betweenPages);
+  // Step 2: Fetch posts (Instaloader bundle or HTTP feed)
   let rawPosts = [];
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const maxPosts = followers >= LIMITS.followerThreshold ? LIMITS.maxPostsLarge : LIMITS.maxPostsSmall;
-      rawPosts = await fetchUserPosts(username, maxPosts);
-      break;
-    } catch (err) {
-      if (err.message === 'HTTP_302' && attempt === 1) {
-        log(`  Posts 302 for @${username}, retrying in 5s...`);
-        await new Promise(r => setTimeout(r, 5000));
-        continue;
+  if (rawPostsFromInstaloader && rawPostsFromInstaloader.length > 0) {
+    rawPosts = rawPostsFromInstaloader;
+  } else {
+    await randomDelay(DELAYS.betweenPages);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const maxPosts = LIMITS.maxPostsPerProfile;
+        rawPosts = await fetchUserPosts(username, maxPosts, acc);
+        break;
+      } catch (err) {
+        if (err.message === 'HTTP_302' && attempt === 1) {
+          log(`  Posts 302 for @${username}, retrying in 5s...`);
+          await new Promise(r => setTimeout(r, 5000));
+          continue;
+        }
+        log(`  Posts failed for @${username}: ${err.message}`);
+        break;
       }
-      log(`  Posts failed for @${username}: ${err.message}`);
-      break;
     }
   }
 
@@ -862,7 +837,12 @@ async function processJob(job) {
   // Step 4: Build result & save
   const result = {
     scraped_at: new Date().toISOString(),
-    crawl_info: { depth, source, our_category: ourCategory },
+    crawl_info: {
+      depth,
+      source,
+      our_category: ourCategory,
+      fetcher: rawPostsFromInstaloader && rawPostsFromInstaloader.length ? 'instaloader' : 'ig_request',
+    },
     data: {
       username: profile.username || username,
       full_name: profile.full_name || username,

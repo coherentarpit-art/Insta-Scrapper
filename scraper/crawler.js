@@ -157,7 +157,7 @@ const SETTINGS = {
 
 // Fast mode — optimized for speed while staying safe
 const FAST_SETTINGS = {
-  maxPostsPerProfile: 12, // 1 page of posts (no pagination needed)
+  maxPostsPerProfile: 50,
   requestsBeforeCooldown: 25,
   cooldownMs: [40000, 60000],
   skipSuggestionsAfterQueue: 150,
