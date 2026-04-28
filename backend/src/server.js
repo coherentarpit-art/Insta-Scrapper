@@ -26,6 +26,10 @@ const DATA_DIR = path.join(__dirname, '..', 'data');
 app.use(cors());
 app.use(express.json());
 
+/** Avoid re-reading every *_complete.json on each list request (large data/ folders) */
+const PROFILES_LIST_CACHE_MS = 30000;
+let profilesListCache = { at: 0, payload: null };
+
 // ---------- MONGODB (optional) ----------
 
 const MONGO_COLLECTION = process.env.MONGO_COLLECTION || 'insta_Profiles';
@@ -523,8 +527,14 @@ app.get('/api/profiles/db', async (req, res) => {
  * Lists all available scraped profiles
  */
 app.get('/api/profiles', (req, res) => {
+  const now = Date.now();
+  if (profilesListCache.payload && now - profilesListCache.at < PROFILES_LIST_CACHE_MS) {
+    return res.json(profilesListCache.payload);
+  }
+
   if (!fs.existsSync(DATA_DIR)) {
-    return res.json({ profiles: [] });
+    profilesListCache = { at: now, payload: { profiles: [] } };
+    return res.json(profilesListCache.payload);
   }
 
   const files = fs.readdirSync(DATA_DIR)
@@ -548,7 +558,8 @@ app.get('/api/profiles', (req, res) => {
     }
   });
 
-  res.json({ profiles });
+  profilesListCache = { at: now, payload: { profiles } };
+  res.json(profilesListCache.payload);
 });
 
 /**

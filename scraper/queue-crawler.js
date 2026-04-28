@@ -115,6 +115,23 @@ const DELAYS = {
 
 const DATA_DIR = path.join(__dirname, '..', 'backend', 'data');
 const ALL_PROFILES_FILE = path.join(__dirname, '..', 'backend', 'all_profiles.json');
+const TODAY_SCRAPED_FILE = path.join(__dirname, '..', 'backend', 'today_scraped.json');
+
+/** Debounced writes to today_scraped.json (ms). Full env: TODAY_SCRAPED_WRITE_MS=2000 */
+const TODAY_SCRAPED_WRITE_MS = Math.max(
+  500,
+  Number(process.env.TODAY_SCRAPED_WRITE_MS || 2000)
+);
+
+/** In-memory buffer: avoids re-reading/parsing multi-MB JSON on every scrape */
+let _todayScraped = {
+  calendarDay: null,
+  profiles: null,
+  usernameToIndex: null,
+  diskLoadedForDay: false,
+  dirty: false,
+  writeTimer: null,
+};
 
 const redisConnection = {
   host: process.env.REDIS_HOST || '127.0.0.1',
@@ -245,24 +262,75 @@ async function saveToMongo(result) {
   }
 }
 
+function ensureTodayScrapedState(todayStr) {
+  if (_todayScraped.calendarDay !== todayStr) {
+    _todayScraped.calendarDay = todayStr;
+    _todayScraped.profiles = [];
+    _todayScraped.usernameToIndex = new Map();
+    _todayScraped.diskLoadedForDay = false;
+  }
+  if (_todayScraped.diskLoadedForDay) return;
+
+  _todayScraped.diskLoadedForDay = true;
+  if (!fs.existsSync(TODAY_SCRAPED_FILE)) return;
+
+  try {
+    const raw = fs.readFileSync(TODAY_SCRAPED_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return;
+    if (parsed[0]._exportDate !== todayStr) return;
+    _todayScraped.profiles = parsed;
+    _todayScraped.usernameToIndex = new Map();
+    parsed.forEach((p, i) => {
+      if (p && p.username) _todayScraped.usernameToIndex.set(String(p.username).toLowerCase(), i);
+    });
+  } catch (_) {
+    _todayScraped.profiles = [];
+    _todayScraped.usernameToIndex = new Map();
+  }
+}
+
+function flushTodayScrapedToDiskSync() {
+  if (!_todayScraped.dirty || !_todayScraped.profiles) return;
+  try {
+    const dir = path.dirname(TODAY_SCRAPED_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const pretty = process.env.TODAY_SCRAPED_PRETTY === '1';
+    const body = pretty
+      ? JSON.stringify(_todayScraped.profiles, null, 2)
+      : JSON.stringify(_todayScraped.profiles);
+    fs.writeFileSync(TODAY_SCRAPED_FILE, body, 'utf8');
+    _todayScraped.dirty = false;
+  } catch (_) {}
+}
+
+function scheduleTodayScrapedWrite() {
+  if (_todayScraped.writeTimer) clearTimeout(_todayScraped.writeTimer);
+  _todayScraped.writeTimer = setTimeout(() => {
+    _todayScraped.writeTimer = null;
+    flushTodayScrapedToDiskSync();
+  }, TODAY_SCRAPED_WRITE_MS);
+}
+
+(function registerTodayScrapedShutdownHooks() {
+  let done = false;
+  const flush = () => {
+    if (done) return;
+    done = true;
+    try {
+      if (_todayScraped.writeTimer) clearTimeout(_todayScraped.writeTimer);
+      flushTodayScrapedToDiskSync();
+    } catch (_) {}
+  };
+  process.once('SIGINT', flush);
+  process.once('SIGTERM', flush);
+  process.once('beforeExit', flush);
+})();
+
 function appendToTodayFile(result) {
   try {
-    const TODAY_FILE = path.join(__dirname, '..', 'backend', 'today_scraped.json');
     const todayStr = new Date().toISOString().slice(0, 10);
-
-    let profiles = [];
-    if (fs.existsSync(TODAY_FILE)) {
-      try {
-        const raw = fs.readFileSync(TODAY_FILE, 'utf8');
-        const parsed = JSON.parse(raw);
-        // Reset if file is from a previous day
-        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]._exportDate !== todayStr) {
-          profiles = [];
-        } else {
-          profiles = Array.isArray(parsed) ? parsed : [];
-        }
-      } catch (_) { profiles = []; }
-    }
+    ensureTodayScrapedState(todayStr);
 
     const entry = {
       _exportDate: todayStr,
@@ -280,13 +348,21 @@ function appendToTodayFile(result) {
       recent_posts: result.recent_posts,
     };
 
-    // Upsert by username
-    const idx = profiles.findIndex(p => p.username === entry.username);
-    if (idx >= 0) profiles[idx] = entry;
-    else profiles.push(entry);
+    const uname = entry.username;
+    if (!uname) return;
 
-    fs.writeFileSync(TODAY_FILE, JSON.stringify(profiles, null, 2), 'utf8');
-  } catch (err) {
+    const profiles = _todayScraped.profiles;
+    const map = _todayScraped.usernameToIndex;
+    const key = String(uname).toLowerCase();
+    const idx = map.get(key);
+    if (idx !== undefined) profiles[idx] = entry;
+    else {
+      map.set(key, profiles.length);
+      profiles.push(entry);
+    }
+    _todayScraped.dirty = true;
+    scheduleTodayScrapedWrite();
+  } catch (_) {
     // Non-fatal — don't crash scraper over file write
   }
 }
