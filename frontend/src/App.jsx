@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import ProfileHeader from './components/ProfileHeader';
 import PlatformTabs from './components/PlatformTabs';
 import StatsGrid from './components/StatsGrid';
 import PostsGrid from './components/PostsGrid';
+import DatabaseProfilePicker from './components/DatabaseProfilePicker';
 
 const API_BASE = '/api';
 
@@ -22,6 +23,20 @@ function normalizeUsername(raw) {
     .replace(/\s+/g, '');
 }
 
+function instaloaderBadgeLabel(c, { cookiesOk = false } = {}) {
+  if (!c || c.fetch_error) return '· …';
+  if (!c.use_instaloader) return '· off';
+  if (c.instaloader_ready) return '· ready';
+  const s = c.instaloader_status;
+  // If browser cookies work, Instaloader is only needed for "Instaloader only" — don't alarm in Auto/Browser
+  if (cookiesOk) {
+    if (s === 'file_missing' || s === 'needs_creds') return '· not set (optional for Auto)';
+  }
+  if (s === 'file_missing') return '· no file at path';
+  if (s === 'needs_creds') return '· set session or password';
+  return '· incomplete';
+}
+
 function App() {
   const [profile, setProfile] = useState(null);
   const [posts, setPosts] = useState([]);
@@ -29,8 +44,13 @@ function App() {
   const [activeTab, setActiveTab] = useState('instagram');
   const [sortBy, setSortBy] = useState('date');
   const [page, setPage] = useState(0);
-  const [loading, setLoading] = useState(false);
+  /** Initial GET /api/profile/:u (saved / Mongo) — only this uses full-page loading. */
+  const [savedProfileLoading, setSavedProfileLoading] = useState(false);
+  /** GET /api/profile/:u/live — inline only, does not hide the whole page. */
+  const [liveLoading, setLiveLoading] = useState(false);
   const [error, setError] = useState(null);
+  /** Live fetch failed but we still have a saved profile — show banner, not full-page error. */
+  const [liveError, setLiveError] = useState(null);
   const [username, setUsername] = useState(() => {
     const q = new URLSearchParams(window.location.search);
     return normalizeUsername(q.get('u') || q.get('username') || '');
@@ -40,8 +60,34 @@ function App() {
   const [livePostBuffer, setLivePostBuffer] = useState(null);
   /** Which flow last failed — so we show the right help text (Mongo vs live cookies). */
   const [errorKind, setErrorKind] = useState(null);
+  /** GET /api/profile/.../live?source= — auto | instaloader | cookies */
+  const [liveFetchMode, setLiveFetchMode] = useState('auto');
+  /** Usernames from API 404 (\"did you mean\" / contains match) */
+  const [savedSuggestions, setSavedSuggestions] = useState([]);
+  /** GET /api/config/live — which paths are configured (no secrets). */
+  const [liveConfig, setLiveConfig] = useState(null);
+  const profileRef = useRef(null);
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
 
   const perPage = 8;
+
+  useEffect(() => {
+    let ok = true;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/config/live`, { cache: 'no-store' });
+        const j = await res.json().catch(() => ({}));
+        if (ok) setLiveConfig(j);
+      } catch {
+        if (ok) setLiveConfig({ fetch_error: true });
+      }
+    })();
+    return () => {
+      ok = false;
+    };
+  }, []);
 
   // Load profile when username changes (?u= also supported via initial state)
   useEffect(() => {
@@ -50,32 +96,38 @@ function App() {
       setPosts([]);
       setTotalPosts(0);
       setError(null);
-      setLoading(false);
+      setLiveError(null);
+      setSavedProfileLoading(false);
+      setLiveLoading(false);
       setDataSource('saved');
       setLivePostBuffer(null);
       return;
     }
     let cancelled = false;
     (async () => {
-      setLoading(true);
+      setSavedProfileLoading(true);
+      setLiveLoading(false);
       setError(null);
+      setLiveError(null);
       setErrorKind(null);
       setProfile(null);
       setLivePostBuffer(null);
       setDataSource('saved');
+      setSavedSuggestions([]);
       try {
         const res = await fetch(`${API_BASE}/profile/${encodeURIComponent(username)}`, {
           cache: 'no-store',
         });
+        const j = await res.json().catch(() => ({}));
         if (!res.ok) {
-          const j = await res.json().catch(() => ({}));
+          setSavedSuggestions(Array.isArray(j.suggestions) ? j.suggestions : []);
           throw new Error(j.message || j.error || 'Profile not found');
         }
-        const data = await res.json();
         if (!cancelled) {
-          setProfile(data);
+          setProfile(j);
           setPage(0);
         }
+        if (!cancelled) setSavedSuggestions([]);
       } catch (err) {
         if (!cancelled) {
           setError(err.message);
@@ -83,7 +135,7 @@ function App() {
           setProfile(null);
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setSavedProfileLoading(false);
       }
     })();
     return () => {
@@ -152,94 +204,296 @@ function App() {
     setUsername(u);
   };
 
+  const selectFromDatabase = (raw) => {
+    const u = normalizeUsername(raw);
+    if (!u) return;
+    setSearchDraft(u);
+    const url = new URL(window.location.href);
+    url.searchParams.set('u', u);
+    window.history.replaceState({}, '', url);
+    setUsername(u);
+  };
+
+  const goHome = () => {
+    setUsername('');
+    setSearchDraft('');
+    setProfile(null);
+    setError(null);
+    setLiveError(null);
+    setErrorKind(null);
+    setSavedSuggestions([]);
+    setDataSource('saved');
+    setLivePostBuffer(null);
+    setPage(0);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('u');
+    url.searchParams.delete('username');
+    window.history.replaceState({}, '', url);
+  };
+
   const loadLiveFromInstagram = async () => {
     const u = normalizeUsername(username);
     if (!u) return;
-    setLoading(true);
+    setLiveLoading(true);
     setError(null);
     setErrorKind(null);
+    setLiveError(null);
+    setSavedSuggestions([]);
     try {
-      const res = await fetch(`${API_BASE}/profile/${encodeURIComponent(u)}/live`, {
+      const qs = new URLSearchParams();
+      qs.set('source', liveFetchMode);
+      qs.set('maxPosts', '12');
+      const res = await fetch(`${API_BASE}/profile/${encodeURIComponent(u)}/live?${qs}`, {
         cache: 'no-store',
       });
       const j = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(j.message || j.error || 'Live fetch failed');
+      if (!res.ok) {
+        const msg = j.message || j.error || `Live fetch failed (${res.status})`;
+        throw new Error(msg);
+      }
       const { recent_posts: recentPosts, ...rest } = j;
       setProfile(rest);
       setDataSource('live');
       setLivePostBuffer(Array.isArray(recentPosts) ? recentPosts : []);
       setPage(0);
+      setLiveError(null);
     } catch (e) {
-      setError(e.message);
-      setErrorKind('live');
+      if (profileRef.current) {
+        setLiveError(e.message || 'Live fetch failed');
+      } else {
+        setError(e.message || 'Live fetch failed');
+        setErrorKind('live');
+      }
     } finally {
-      setLoading(false);
+      setLiveLoading(false);
     }
   };
 
+  const appNav = () => {
+    const onProfile = Boolean(username);
+    return (
+      <header className="flex items-center justify-between gap-2 border-b border-violet-100/90 bg-gradient-to-r from-violet-50/95 via-white to-rose-50/30 px-3 py-2.5 sm:px-4">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 sm:gap-3">
+          {onProfile && (
+            <button
+              type="button"
+              onClick={goHome}
+              className="inline-flex shrink-0 items-center gap-0.5 rounded-lg border border-violet-200/80 bg-white/80 px-2 py-1.5 text-xs font-medium text-violet-800 shadow-sm transition hover:bg-violet-100/60 sm:gap-1.5 sm:px-2.5 sm:text-sm"
+            >
+              <span className="text-base leading-none" aria-hidden>
+                ←
+              </span>
+              <span className="hidden sm:inline">All profiles</span>
+              <span className="sm:hidden">Back</span>
+            </button>
+          )}
+          {onProfile ? (
+            <p className="min-w-0 truncate text-sm font-medium text-gray-800 sm:text-base" title={username}>
+              <span className="text-gray-500">@</span>
+              {username}
+            </p>
+          ) : (
+            <h1 className="text-sm font-bold tracking-tight text-violet-900 sm:text-base">Profile viewer</h1>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+          {onProfile && (
+            <button
+              type="button"
+              onClick={goHome}
+              className="rounded-lg px-2 py-1.5 text-xs font-semibold text-violet-700 underline-offset-2 hover:bg-violet-100/50 hover:underline sm:px-3 sm:text-sm"
+            >
+              Home
+            </button>
+          )}
+          <span className="hidden text-[10px] font-medium uppercase tracking-wider text-gray-400 sm:inline sm:text-xs">IG insights</span>
+        </div>
+      </header>
+    );
+  };
+
   const searchBar = (
-    <div className="max-w-2xl mx-auto flex flex-wrap items-center gap-2 px-4 py-3">
-      <input
-        type="text"
-        value={searchDraft}
-        onChange={(e) => setSearchDraft(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && applySearch()}
-        placeholder="Instagram username (no @)"
-        className="flex-1 min-w-[140px] border border-gray-200 rounded-lg px-3 py-2 text-sm text-gray-800 placeholder:text-gray-400"
-      />
-      <button
-        type="button"
-        onClick={applySearch}
-        disabled={loading}
-        className="shrink-0 px-4 py-2 rounded-lg bg-violet-600 text-white text-sm font-medium hover:bg-violet-700 disabled:opacity-50"
-      >
-        {loading ? 'Loading…' : 'Load saved'}
-      </button>
-      <button
-        type="button"
-        onClick={loadLiveFromInstagram}
-        disabled={loading || !username}
-        className="shrink-0 px-4 py-2 rounded-lg border border-pink-300 bg-pink-50 text-pink-800 text-sm font-medium hover:bg-pink-100 disabled:opacity-50"
-        title={
-          username
-            ? 'Fetches current followers and likes from Instagram (not saved to Mongo)'
-            : 'Load a profile first (Load saved)'
-        }
-      >
-        Live from Instagram
-      </button>
+    <div className="max-w-4xl mx-auto space-y-3 px-3 py-3 sm:px-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-stretch sm:gap-2">
+        <div className="flex min-w-0 flex-1 flex-col gap-1.5 sm:flex-row sm:items-center">
+          <input
+            type="text"
+            value={searchDraft}
+            onChange={(e) => setSearchDraft(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && applySearch()}
+            placeholder="username (no @)"
+            className="min-w-0 flex-1 rounded-lg border border-gray-200/90 bg-white px-3 py-2.5 text-sm text-gray-900 shadow-sm placeholder:text-gray-400 focus:border-violet-300 focus:outline-none focus:ring-2 focus:ring-violet-200"
+          />
+          <button
+            type="button"
+            onClick={applySearch}
+            disabled={savedProfileLoading}
+            className="shrink-0 rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {savedProfileLoading ? 'Loading…' : 'Load saved'}
+          </button>
+        </div>
+        <div className="h-px bg-gray-100 sm:hidden" aria-hidden="true" />
+        <div className="flex flex-1 flex-col gap-1.5 rounded-xl border border-rose-100/90 bg-rose-50/40 p-2.5 sm:min-w-[min(100%,300px)] sm:max-w-md sm:flex-initial">
+          <div className="flex items-center justify-between gap-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-rose-900/80 sm:text-xs">Live fetch</span>
+            <span className="text-[9px] text-rose-700/70 sm:text-[10px]">not saved to DB</span>
+          </div>
+          {liveConfig && !liveConfig.fetch_error && (() => {
+            const ilOk = liveConfig.instaloader_ready;
+            const useIl = liveConfig.use_instaloader;
+            const cookiesOk = liveConfig.has_ig_cookies;
+            const ilSoft = useIl && !ilOk && cookiesOk;
+            return (
+            <div className="flex flex-wrap items-center gap-1.5" aria-label="Server live configuration">
+              {useIl && (
+              <span
+                className={`inline-flex max-w-full items-center rounded px-1.5 py-0.5 text-[9px] font-medium sm:text-[10px] ${
+                  ilOk
+                    ? 'bg-emerald-100/90 text-emerald-900'
+                    : ilSoft
+                      ? 'bg-slate-200/80 text-slate-600'
+                      : useIl
+                        ? 'bg-amber-100/90 text-amber-900'
+                        : 'bg-gray-200/60 text-gray-600'
+                }`}
+                title={
+                  ilSoft
+                    ? 'Instaloader session file not on disk, but your browser cookies work — Auto and Browser will still fetch live. Fix this only if you use “Instaloader only”.'
+                    : 'USE_INSTALOADER=1 plus INSTALOADER_SESSION_FILE (file must exist) or INSTALOADER_USER+PASSWORD. backend/.env and scraper/.env are both loaded.'
+                }
+              >
+                Instaloader {instaloaderBadgeLabel(liveConfig, { cookiesOk })}
+              </span>
+              )}
+              <span
+                className={`inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-medium sm:text-[10px] ${
+                  liveConfig.has_ig_cookies ? 'bg-emerald-100/90 text-emerald-900' : 'bg-amber-100/90 text-amber-900'
+                }`}
+                title="IG_ACC1_COOKIES/IG_COOKIES + IG_ACC1_CSRF/IG_CSRF_TOKEN in backend or scraper .env"
+              >
+                Browser {liveConfig.has_ig_cookies ? '· session set' : '· cookies missing'}
+              </span>
+            </div>
+            );
+          })()}
+          {/* No browser cookies: show full Instaloader setup (they may depend on Python) */}
+          {liveConfig?.instaloader_status === 'file_missing' && liveConfig?.use_instaloader && !liveConfig.has_ig_cookies && (
+            <p className="text-[9px] leading-snug text-amber-900/90 sm:text-[10px]">
+              Instaloader: <code className="rounded bg-white/50 px-0.5">INSTALOADER_SESSION_FILE</code> must point to a real file. Run{' '}
+              <code className="rounded bg-white/50 px-0.5">python -m instaloader --login YOUR_IG_USER</code>, set the path to the{' '}
+              <code className="rounded bg-white/50 px-0.5">session-…</code> file, or <code className="rounded bg-white/50 px-0.5">USE_INSTALOADER=0</code>.
+            </p>
+          )}
+          {liveConfig?.instaloader_status === 'needs_creds' && liveConfig?.use_instaloader && !liveConfig.has_ig_cookies && (
+            <p className="text-[9px] leading-snug text-amber-900/90 sm:text-[10px]">
+              Add <code className="rounded bg-white/50 px-0.5">INSTALOADER_SESSION_FILE</code> + <code className="rounded bg-white/50 px-0.5">INSTALOADER_SESSION_USER</code> (or user+password) and restart, or <code className="rounded bg-white/50 px-0.5">USE_INSTALOADER=0</code>.
+            </p>
+          )}
+          {liveConfig && liveConfig.mongo_uri_set && !liveConfig.mongo_connected && (
+            <p className="text-[9px] text-rose-800/90 sm:text-[10px]">
+              Mongo: URI is set but the API is <strong>not connected</strong> (see backend logs). The profile list may stay empty until the connection works.
+            </p>
+          )}
+          {liveConfig?.fetch_error && (
+            <p className="text-[9px] text-amber-800 sm:text-[10px]">Could not read /api/config/live — is the backend running?</p>
+          )}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <select
+              value={liveFetchMode}
+              onChange={(e) => setLiveFetchMode(e.target.value)}
+              className="w-full rounded-md border border-rose-200/80 bg-white px-2.5 py-2 text-xs text-gray-800 shadow-sm sm:min-w-[10rem] sm:max-w-[12rem] sm:text-[13px]"
+              title="Instaloader and/or browser cookies in backend/.env"
+            >
+              <option value="auto">Auto (try Instaloader, else cookies)</option>
+              <option value="instaloader">Instaloader only</option>
+              <option value="cookies">Browser session only</option>
+            </select>
+            <button
+              type="button"
+              onClick={loadLiveFromInstagram}
+              disabled={liveLoading || !username}
+              className="w-full shrink-0 rounded-md border border-rose-300/90 bg-gradient-to-b from-rose-50 to-white px-3 py-2 text-xs font-semibold text-rose-900 shadow-sm transition hover:border-rose-400 hover:from-rose-100/60 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:whitespace-nowrap sm:px-4"
+              title={username ? 'Fetches a live Instagram snapshot' : 'Enter or pick a profile first'}
+            >
+              {liveLoading ? 'Fetching…' : '↻ Refresh live'}
+            </button>
+          </div>
+          {liveFetchMode === 'instaloader' && liveConfig?.use_instaloader && !liveConfig.instaloader_ready && liveConfig.has_ig_cookies && (
+            <p className="text-[10px] leading-snug text-sky-900/95 sm:text-xs rounded-md border border-sky-200/90 bg-sky-50/90 px-2.5 py-2">
+              <strong>Instaloader only</strong> needs a valid session file in .env. You already have <strong>Browser · session set</strong> — switch
+              the dropdown to <strong>Auto</strong> or <strong>Browser session only</strong>, then <strong>↻ Refresh live</strong>. (Or create the session file with{' '}
+              <code className="rounded bg-white/70 px-0.5 text-[9px]">python -m instaloader --login …</code> to use this mode.)
+            </p>
+          )}
+          {liveFetchMode === 'instaloader' && liveConfig && !liveConfig.instaloader_ready && !liveConfig.has_ig_cookies && (
+            <p className="text-[10px] leading-snug text-amber-900/90 sm:text-xs">
+              <strong>Instaloader only</strong> will not work until the Instaloader badge is <strong>ready</strong> (session file) or you set browser cookies in .env and use <strong>Auto</strong>.
+            </p>
+          )}
+          {liveFetchMode === 'cookies' && liveConfig && !liveConfig.has_ig_cookies && (
+            <p className="text-[10px] leading-snug text-amber-900/90 sm:text-xs">
+              Set <code className="rounded bg-white/60 px-0.5">IG_ACC1_COOKIES</code> / <code className="rounded bg-white/60 px-0.5">IG_COOKIES</code> and
+              <code className="rounded bg-white/60 px-0.5">IG_ACC1_CSRF</code> / <code className="rounded bg-white/60 px-0.5">IG_CSRF_TOKEN</code> in <code className="rounded bg-white/60 px-0.5">backend/.env</code>, then restart the API.
+            </p>
+          )}
+        </div>
+      </div>
     </div>
   );
 
   if (!username) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 px-4">
-        <h1 className="text-2xl font-bold text-gray-900 mb-2">Profile viewer</h1>
-        <p className="text-gray-500 text-sm mb-4 text-center max-w-md">
-          <strong>Load saved</strong> reads Mongo / files. <strong>Live from Instagram</strong> pulls current followers and likes (uses cookies in backend/.env; not saved to your DB).
-        </p>
-        {searchBar}
-      </div>
-    );
-  }
-
-  if (loading) {
-    return (
       <div className="min-h-screen flex flex-col bg-gray-50">
-        {searchBar}
-        <div className="flex-1 flex items-center justify-center">
-          <div className="text-center">
-            <div className="animate-spin rounded-full h-12 w-12 border-2 border-violet-600 border-t-transparent mx-auto mb-4"></div>
-            <p className="text-gray-500">Loading @{username}…</p>
+        {appNav()}
+        <div className="px-4 py-6 sm:py-8">
+          <p className="text-gray-500 text-sm mb-4 text-center max-w-2xl mx-auto">
+            <strong>Load saved</strong> = Mongo/JSON from the worker. <strong>Refresh live</strong> = Instagram right now
+            (nothing written to Mongo from this page). See status badges in <strong>Live fetch</strong> for Instaloader vs browser
+            session.
+          </p>
+          {searchBar}
+          <div className="max-w-4xl w-full mx-auto grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
+            <DatabaseProfilePicker
+              onSelect={selectFromDatabase}
+              disabled={savedProfileLoading}
+              mongoInfo={liveConfig && !liveConfig.fetch_error
+                ? { uriSet: liveConfig.mongo_uri_set, connected: liveConfig.mongo_connected }
+                : null}
+            />
+            <div className="rounded-xl border border-dashed border-gray-200 bg-gray-50/80 p-4 text-sm text-gray-600">
+              <p className="font-medium text-gray-800 mb-2">Live mode</p>
+              <ul className="list-disc pl-4 space-y-1 text-xs sm:text-sm">
+                <li><strong>Auto</strong> — try Instaloader, then your saved browser cookies in .env</li>
+                <li><strong>Instaloader</strong> — needs the <strong>ready</strong> badge; session file on disk and <code className="text-xs">USE_INSTALOADER=1</code></li>
+                <li><strong>Browser</strong> — <code>IG_COOKIES</code> + <code>IG_CSRF_TOKEN</code> (or <code>IG_ACC1_*</code>) from DevTools</li>
+              </ul>
+            </div>
           </div>
         </div>
       </div>
     );
   }
 
-  if (error || !profile) {
+  if (savedProfileLoading) {
     return (
       <div className="min-h-screen flex flex-col bg-gray-50">
+        {appNav()}
+        {searchBar}
+        <div className="flex-1 flex items-center justify-center">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-2 border-violet-600 border-t-transparent mx-auto mb-4"></div>
+            <p className="text-gray-500">Loading saved data for @{username}…</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!profile) {
+    return (
+      <div className="min-h-screen flex flex-col bg-gray-50">
+        {appNav()}
         {searchBar}
         <div className="flex-1 flex items-center justify-center px-6">
           <div className="text-center max-w-md">
@@ -249,12 +503,19 @@ function App() {
               </svg>
             </div>
             <h2 className="text-xl font-bold text-gray-800 mb-2">Could not load @{username}</h2>
-            <p className="text-gray-500 mb-4 text-sm">{error || 'No data'}</p>
+            <p className="text-gray-500 mb-4 text-sm break-words text-left max-w-md mx-auto">{error || liveError || 'No data'}</p>
             {errorKind === 'live' ? (
-              <p className="text-gray-400 text-xs">
-                Live uses the same Instagram HTTP layer as the queue worker (<code className="text-gray-500">scraper/ig-request.js</code>).
-                Set <code className="text-gray-500">IG_ACC1_COOKIES</code> and <code className="text-gray-500">IG_ACC1_CSRF</code> in <strong>backend/.env</strong> (match your scraper session), then restart the backend. This path does not read Mongo.
-              </p>
+              <div className="text-gray-500 text-xs text-left max-w-md mx-auto space-y-2">
+                <p>
+                  <strong>Browser / cookies</strong> — <code>IG_ACC1_COOKIES</code> + <code>IG_ACC1_CSRF</code> in <code>backend/.env</code> (or <code>scraper/.env</code> merge), then restart the API. Same as <code>scraper/ig-request.js</code>.
+                </p>
+                <p>
+                  <strong>Instaloader</strong> — <code>USE_INSTALOADER=1</code>, <code>INSTALOADER_SESSION_FILE</code> + <code>INSTALOADER_SESSION_USER</code> (or user/password). If the error mentions “session check”, add <code>INSTALOADER_SKIP_TEST_LOGIN=1</code> in <code>scraper/.env</code> and restart.
+                </p>
+                <p>
+                  Check the <strong>Live fetch</strong> badges in the bar above: Instaloader and Browser session should show <strong>ready / set</strong> for the mode you use.
+                </p>
+              </div>
             ) : (
               <p className="text-gray-400 text-xs">
                 Load saved needs this profile in Mongo or <code className="text-gray-500">backend/data/&lt;user&gt;_complete.json</code>. Scrape with the queue worker first and set <code className="text-gray-500">MONGO_URI</code> in backend/.env if you use Atlas.
@@ -270,9 +531,45 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      <div className="sticky top-0 z-10 bg-gray-50/95 backdrop-blur border-b border-gray-100">
+      <div className="sticky top-0 z-10 border-b border-gray-100/90 bg-gray-50/95 backdrop-blur">
+        {appNav()}
         {searchBar}
+        <div className="max-w-4xl mx-auto px-4 pb-2">
+          <details className="text-sm">
+            <summary className="text-violet-600 cursor-pointer select-none font-medium">Pick another profile from database</summary>
+            <div className="mt-2">
+              <DatabaseProfilePicker
+                onSelect={selectFromDatabase}
+                disabled={savedProfileLoading}
+                mongoInfo={liveConfig && !liveConfig.fetch_error
+                  ? { uriSet: liveConfig.mongo_uri_set, connected: liveConfig.mongo_connected }
+                  : null}
+              />
+            </div>
+          </details>
+        </div>
       </div>
+      {liveError && (
+        <div className="max-w-6xl mx-auto px-4 pt-4">
+          <div className="flex flex-col gap-2 rounded-lg border border-red-200 bg-red-50/95 px-3 py-2.5 text-sm text-red-900 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+            <p className="min-w-0 break-words">
+              <strong>Refresh live failed.</strong> {liveError}
+              {(liveError.includes('Failed to fetch') || liveError.includes('NetworkError')) && (
+                <span className="block mt-1 text-xs text-red-800/90">
+                  Check that the backend is running (e.g. <code className="rounded bg-white/60 px-1">npm start</code> in <code className="rounded bg-white/60 px-1">backend/</code>) and the Vite dev server proxies to port 3001.
+                </span>
+              )}
+            </p>
+            <button
+              type="button"
+              onClick={() => setLiveError(null)}
+              className="shrink-0 self-end rounded-md border border-red-200/80 bg-white px-2 py-1 text-xs font-medium text-red-800 hover:bg-red-100/50 sm:self-auto"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
       {/* Profile Header */}
       <div className="max-w-6xl mx-auto px-4 pt-6">
         <ProfileHeader profile={profile} proxyImg={proxyImg} />
@@ -293,9 +590,23 @@ function App() {
       <main className="max-w-6xl mx-auto px-4 pb-12">
         <div className="bg-white rounded-b-xl shadow-sm border border-gray-100 border-t-0 p-6 space-y-10">
           {profile.data_source === 'instagram_live' && (
-            <p className="text-sm text-pink-800 bg-pink-50 border border-pink-100 rounded-lg px-3 py-2">
-              Live snapshot from Instagram (up to 12 posts in this view). Numbers are not written to Mongo — click &quot;Load saved&quot; to view last stored scrape.
-            </p>
+            <div className="text-sm text-pink-800 bg-pink-50 border border-pink-100 rounded-lg px-3 py-2 space-y-1">
+              <p>
+                <strong>Live snapshot</strong> (up to 12 posts in this view). Not saved to Mongo — use <strong>Load saved</strong> to see the last
+                database scrape.
+              </p>
+              {Array.isArray(profile.methods) && profile.methods.length > 0 && (
+                <p className="text-xs text-pink-900/80">
+                  Fetched with: {profile.methods.join(' · ')}
+                  {profile.methods.includes('instaloader') && (
+                    <span className="ml-1 inline-block rounded bg-white/80 border border-pink-200 px-1.5 py-0.5">Instaloader</span>
+                  )}
+                  {profile.live_source && (
+                    <span className="ml-1">(request: {profile.live_source})</span>
+                  )}
+                </p>
+              )}
+            </div>
           )}
           {/* Stats */}
           <StatsGrid

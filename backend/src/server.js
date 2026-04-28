@@ -13,6 +13,11 @@ const https = require('https');
 const mongoose = require('mongoose');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+// Reuse Instaloader (Python) and other scraper-time vars if only scraper/.env is configured.
+const scraperEnv = path.join(__dirname, '..', '..', 'scraper', '.env');
+if (fs.existsSync(scraperEnv)) {
+  require('dotenv').config({ path: scraperEnv, override: false });
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -32,18 +37,57 @@ function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * 1) Exact (case-insensitive) match on data.username
+ * 2) If that fails, at most one doc whose data.username is a prefix of the request (e.g. query "hiloni" → "hilonicakes" only)
+ *    (If multiple usernames start with the search string, no auto-pick — caller may show suggestions)
+ */
 async function loadProfileFromMongo(username) {
   if (mongoose.connection.readyState !== 1) return null;
   const u = String(username || '').trim().replace(/^@/, '');
   if (!u) return null;
   try {
-    const doc = await Profile.findOne({
+    const exact = await Profile.findOne({
       'data.username': new RegExp(`^${escapeRegex(u)}$`, 'i'),
     }).lean();
-    return doc && doc.data ? doc : null;
+    if (exact && exact.data) return exact;
+
+    if (u.length < 2) return null;
+    const reStart = new RegExp('^' + escapeRegex(u), 'i');
+    const prefixMatches = await Profile.find({ 'data.username': reStart })
+      .limit(25)
+      .lean();
+    const ok = (prefixMatches || []).filter((d) => d && d.data && d.data.username);
+    if (ok.length === 0) return null;
+    if (ok.length === 1) return ok[0];
+    const exact2 = ok.find((d) => d.data.username.toLowerCase() === u.toLowerCase());
+    if (exact2) return exact2;
+    // Ambiguous: e.g. both "hiloni" and "hilonicakes" in DB; do not guess
+    return null;
   } catch (err) {
     console.warn('Mongo profile lookup:', err.message);
     return null;
+  }
+}
+
+/** For 404 responses — "did you mean" */
+async function suggestUsernamesForQuery(u) {
+  if (mongoose.connection.readyState !== 1) return [];
+  const t = String(u || '').trim().replace(/^@/, '');
+  if (t.length < 2) return [];
+  try {
+    const re = new RegExp(escapeRegex(t), 'i');
+    const rows = await Profile.find({ 'data.username': re })
+      .select({ 'data.username': 1 })
+      .limit(20)
+      .lean();
+    const out = new Set();
+    (rows || []).forEach((r) => {
+      if (r?.data?.username) out.add(r.data.username);
+    });
+    return Array.from(out).sort((a, b) => a.length - b.length);
+  } catch {
+    return [];
   }
 }
 
@@ -58,14 +102,39 @@ function loadProfileData(username) {
   return JSON.parse(raw);
 }
 
+/**
+ * If exactly one *filename* in data/ is clearly the match for a short handle (e.g. hilonicakes_complete for "hiloni")
+ */
+function loadProfileDataFuzzyOrExact(username) {
+  const u = String(username || '')
+    .trim()
+    .replace(/^@/, '');
+  if (!u) return null;
+  const direct = loadProfileData(u) || loadProfileData(u.toLowerCase());
+  if (direct) return direct;
+  if (!fs.existsSync(DATA_DIR)) return null;
+  if (u.length < 2) return null;
+  const files = fs
+    .readdirSync(DATA_DIR)
+    .filter((f) => f.endsWith('_complete.json'));
+  const stems = files
+    .map((f) => f.replace(/_complete\.json$/i, ''))
+    .filter(Boolean);
+  const reStart = new RegExp('^' + escapeRegex(u), 'i');
+  const byPrefix = stems.filter((s) => reStart.test(s));
+  if (byPrefix.length === 1) {
+    return loadProfileData(byPrefix[0]) || loadProfileData(byPrefix[0].toLowerCase());
+  }
+  return null;
+}
+
 /** Same shape as Mongo: full document with .data and .scraped_at */
 async function resolveProfileDocument(username) {
   const u = String(username || '').trim().replace(/^@/, '');
   if (!u) return null;
   const fromMongo = await loadProfileFromMongo(u);
   if (fromMongo) return fromMongo;
-  const fromFile = loadProfileData(u) || loadProfileData(u.toLowerCase());
-  return fromFile;
+  return loadProfileDataFuzzyOrExact(u);
 }
 
 function computeMedian(arr) {
@@ -222,6 +291,53 @@ function buildProfileApiPayload(scraped, options = {}) {
 // ---------- ROUTES ----------
 
 /**
+ * GET /api/config/live
+ * Safe, non-secret flags for the UI (Instaloader + browser session readiness).
+ */
+app.get('/api/config/live', (req, res) => {
+  const v = String(process.env.USE_INSTALOADER || '').toLowerCase();
+  const useInstaloader = v === '1' || v === 'true' || v === 'yes';
+  const cookies = String(process.env.IG_ACC1_COOKIES || process.env.IG_COOKIES || '').trim();
+  const csrf = String(process.env.IG_ACC1_CSRF || process.env.IG_CSRF_TOKEN || '').trim();
+  const hasIgCookies = Boolean(cookies && csrf);
+  const sessionFile = String(process.env.INSTALOADER_SESSION_FILE || '').trim();
+  let instaloaderSessionFileExists = false;
+  if (sessionFile) {
+    try {
+      instaloaderSessionFileExists = fs.existsSync(sessionFile);
+    } catch {
+      instaloaderSessionFileExists = false;
+    }
+  }
+  const ilUser = String(process.env.INSTALOADER_USER || '').trim();
+  const ilPass = String(process.env.INSTALOADER_PASSWORD || process.env.INSTALOADER_PASS || '').trim();
+  const hasInstaloaderPasswordLogin = Boolean(ilUser && ilPass);
+  const instaloaderReady = useInstaloader && (instaloaderSessionFileExists || hasInstaloaderPasswordLogin);
+  let instaloader_status = 'off';
+  if (useInstaloader) {
+    if (instaloaderReady) {
+      instaloader_status = 'ready';
+    } else if (sessionFile && !instaloaderSessionFileExists) {
+      instaloader_status = 'file_missing';
+    } else {
+      instaloader_status = 'needs_creds';
+    }
+  }
+  const mongoUriSet = Boolean(String(process.env.MONGO_URI || '').trim());
+  return res.json({
+    use_instaloader: useInstaloader,
+    has_ig_cookies: hasIgCookies,
+    instaloader_session_path_set: Boolean(sessionFile),
+    instaloader_session_file_exists: instaloaderSessionFileExists,
+    instaloader_has_password_login: hasInstaloaderPasswordLogin,
+    instaloader_ready: instaloaderReady,
+    instaloader_status,
+    mongo_uri_set: mongoUriSet,
+    mongo_connected: mongoose.connection.readyState === 1,
+  });
+});
+
+/**
  * GET /api/profile/:username/live
  * Fetches current followers / post likes from Instagram (uses IG_* cookies in backend/.env).
  * Does not write MongoDB. Register before /api/profile/:username.
@@ -234,8 +350,16 @@ app.get('/api/profile/:username/live', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: 'live_module', message: err.message });
   }
+  const src = String(req.query.source || 'auto').toLowerCase();
+  if (!['auto', 'instaloader', 'cookies'].includes(src)) {
+    return res.status(400).json({ error: 'bad_source', message: 'source must be auto, instaloader, or cookies' });
+  }
+  const maxPosts = Math.min(Math.max(parseInt(String(req.query.maxPosts), 10) || 12, 1), 50);
   try {
-    const scraped = await fetchLive.fetchLiveAsScrapedDoc(req.params.username, { maxPosts: 12 });
+    const scraped = await fetchLive.fetchLiveAsScrapedDoc(req.params.username, {
+      maxPosts,
+      source: src,
+    });
     if (!scraped) {
       return res.status(404).json({ error: 'Profile not found', message: 'Instagram returned no profile.' });
     }
@@ -244,16 +368,26 @@ app.get('/api/profile/:username/live', async (req, res) => {
     }
     const payload = buildProfileApiPayload(scraped, { includeRecentPosts: true });
     payload.data_source = 'instagram_live';
+    payload.live_source = src;
     return res.json(payload);
   } catch (err) {
+    if (err.code === 'INSTALOADER_FAILED' || err.code === 'INSTALOADER_DISABLED') {
+      return res.status(503).json({
+        error: err.code,
+        message: err.message,
+      });
+    }
+    if (err.code === 'PROFILE_EMPTY') {
+      return res.status(404).json({ error: 'PROFILE_EMPTY', message: err.message });
+    }
     const code = err.message;
     const status =
       code === 'RATE_LIMITED' ? 429 : code === 'AUTH_ERROR' ? 401 : code.startsWith('HTTP_') ? 502 : 502;
     return res.status(status).json({
-      error: code,
+      error: err.code || code,
       message:
         code === 'AUTH_ERROR'
-          ? 'Invalid or expired Instagram session — refresh IG_ACC* cookies in backend/.env'
+          ? 'Invalid or expired Instagram session — refresh IG_COOKIES + IG_CSRF_TOKEN in backend/.env (copy from Chrome DevTools) and optional IG_LSD, then restart the API'
           : err.message,
     });
   }
@@ -273,9 +407,15 @@ app.get('/api/profile/:username', async (req, res) => {
   }
 
   if (!scraped || !scraped.data) {
+    const u = String(username || '')
+      .trim()
+      .replace(/^@/, '');
+    const suggestions = await suggestUsernamesForQuery(u);
     return res.status(404).json({
       error: 'Profile not found',
-      message: `No data for @${username}. Scrape them first (queue worker) or add backend/.env MONGO_URI.`,
+      message: `No stored data for @${u} (Mongo / backend/data). Try a full handle from the list, or use "Refresh live" for a public account.`,
+      username: u,
+      suggestions,
     });
   }
 
@@ -338,6 +478,44 @@ app.get('/api/profile/:username/posts', async (req, res) => {
     sort,
     has_more: offset + size < total,
   });
+});
+
+/**
+ * GET /api/profiles/db?q=&limit=
+ * Profiles stored in MongoDB (same collection as queue-crawler) — for UI picker.
+ */
+app.get('/api/profiles/db', async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.json({ profiles: [], mongo_connected: false });
+  }
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit), 10) || 200, 1), 500);
+  const q = String(req.query.q || '').trim();
+  let filter = {};
+  if (q) {
+    filter['data.username'] = { $regex: escapeRegex(q), $options: 'i' };
+  } else {
+    filter['data.username'] = { $exists: true, $nin: [null, ''] };
+  }
+  try {
+    const rows = await Profile.find(filter)
+      .select({ 'data.username': 1, 'data.full_name': 1, 'data.followers': 1, 'data.profile_pic': 1, scraped_at: 1 })
+      .sort({ scraped_at: -1 })
+      .limit(limit)
+      .lean();
+    const profiles = rows
+      .map((row) => ({
+        username: row.data?.username,
+        full_name: row.data?.full_name || '',
+        followers: row.data?.followers ?? 0,
+        profile_pic: row.data?.profile_pic || '',
+        scraped_at: row.scraped_at,
+        our_category: row.data?.our_category || (row.crawl_info && row.crawl_info.our_category) || '',
+      }))
+      .filter((p) => p.username);
+    return res.json({ profiles, mongo_connected: true, total: profiles.length });
+  } catch (e) {
+    return res.status(500).json({ error: e.message, profiles: [], mongo_connected: true });
+  }
 });
 
 /**
@@ -426,8 +604,10 @@ async function start() {
     console.log(`\n  Backend API running on http://localhost:${PORT}`);
     console.log(`  Data directory: ${DATA_DIR}\n`);
     console.log('  Endpoints:');
-    console.log('    GET /api/profiles                     - List all profiles');
-  console.log('    GET /api/profile/:username/live        - Live Instagram (cookies in .env; no DB write)');
+    console.log('    GET /api/profiles                     - List profiles (local JSON in data/)');
+  console.log('    GET /api/profiles/db?q=               - List profiles in Mongo (for UI)');
+  console.log('    GET /api/config/live                  - Instaloader + cookie flags (for UI, no secrets)');
+  console.log('    GET /api/profile/:username/live         - Live Instagram (?source=auto|instaloader|cookies&maxPosts=12)');
   console.log('    GET /api/profile/:username             - Profile info + metrics (Mongo / JSON)');
   console.log('    GET /api/profile/:username/posts       - Paginated posts');
     console.log('        ?sort=date|likes|comments');

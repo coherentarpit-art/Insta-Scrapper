@@ -63,25 +63,28 @@ function httpGetJson(url, extraHeaders = {}, account) {
   const claim = (process.env.IG_WWW_CLAIM || '').trim() || DEFAULT_WWW_CLAIM;
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
+    const lsd = (process.env.IG_LSD || process.env.IG_FBLSD || '').trim();
+    const headers = {
+      accept: '*/*',
+      'accept-language': 'en-US,en;q=0.9',
+      cookie: account.cookies,
+      'user-agent': IG_CONFIG.userAgent,
+      'x-csrftoken': account.csrf,
+      'x-ig-app-id': IG_CONFIG.igAppId,
+      'x-asbd-id': process.env.IG_ASBD_ID || '359341',
+      'x-ig-www-claim': claim,
+      'x-requested-with': 'XMLHttpRequest',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-origin',
+      referer: 'https://www.instagram.com/',
+      ...extraHeaders,
+    };
+    if (lsd) headers['x-fb-lsd'] = lsd;
     const options = {
       hostname: urlObj.hostname,
       path: urlObj.pathname + urlObj.search,
       method: 'GET',
-      headers: {
-        accept: '*/*',
-        'accept-language': 'en-US,en;q=0.9',
-        cookie: account.cookies,
-        'user-agent': IG_CONFIG.userAgent,
-        'x-csrftoken': account.csrf,
-        'x-ig-app-id': IG_CONFIG.igAppId,
-        'x-asbd-id': process.env.IG_ASBD_ID || '359341',
-        'x-ig-www-claim': claim,
-        'x-requested-with': 'XMLHttpRequest',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        referer: 'https://www.instagram.com/',
-        ...extraHeaders,
-      },
+      headers,
     };
     const req = https.request(options, (res) => {
       let data = '';

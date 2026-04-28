@@ -699,7 +699,7 @@ async function processJob(job) {
       username,
       LIMITS.maxPostsPerProfile
     );
-    if (pack) {
+    if (pack && !pack.failed) {
       profile = pack.profile;
       rawPostsFromInstaloader = pack.items || [];
       if (rawPostsFromInstaloader.length > 0) {
@@ -707,6 +707,21 @@ async function processJob(job) {
       } else {
         log(`  Instaloader: @${username} profile only (0 posts) — fetching posts via HTTP`);
         rawPostsFromInstaloader = null;
+      }
+    } else if (pack && pack.failed) {
+      const errText = String(pack.error || 'unknown');
+      // Instaloader uses the same exception for "not found" and blocked/stale session — only the username in the string differs.
+      const errPattern = errText.replace(/'[^']*'/g, "'*'");
+      if (!global._ilFailPattern) {
+        log(`  Instaloader failed: ${errText}`);
+        global._ilFailPattern = errPattern;
+      } else if (global._ilFailPattern === errPattern) {
+        log(
+          `  Instaloader: @${username} — same failure (session/IG is blocking lookups, not a wrong handle). Set USE_INSTALOADER=0 in scraper/.env to skip Python.`
+        );
+      } else {
+        log(`  Instaloader failed: ${errText}`);
+        global._ilFailPattern = errPattern;
       }
     }
   }

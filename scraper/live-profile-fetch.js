@@ -291,29 +291,60 @@ function computeMetrics(posts, followers) {
 }
 
 /**
- * @returns {Promise<{ scraped_at: string, data: object } | null>}
+ * @param {object} [options]
+ * @param {number} [options.maxPosts]
+ * @param {'auto'|'instaloader'|'cookies'} [options.source]  auto = try Instaloader (if enabled) then cookies; instaloader = only Python; cookies = only IG session in .env
+ * @returns {Promise<{ scraped_at: string, data: object, methods: string[] } | null>}
  */
 async function fetchLiveAsScrapedDoc(username, options = {}) {
   const maxPosts = options.maxPosts ?? 12;
+  const source = options.source || 'auto';
   const u = String(username || '')
     .trim()
     .replace(/^@/, '');
   if (!u) return null;
 
+  const tryIL = source === 'auto' || source === 'instaloader';
+  const tryCookies = source === 'auto' || source === 'cookies';
+
   const { isInstaloaderEnabled, fetchInstaloaderProfileAndPosts } = require('./instaloader-bridge');
-  if (isInstaloaderEnabled()) {
-    const pack = await fetchInstaloaderProfileAndPosts(u, maxPosts);
-    if (pack) {
-      const { profile, items } = pack;
-      if (profile.is_private) {
-        return {
-          scraped_at: new Date().toISOString(),
-          data: { ...profile, username: u },
-          _private: true,
-        };
+  if (tryIL) {
+    if (isInstaloaderEnabled()) {
+      const pack = await fetchInstaloaderProfileAndPosts(u, maxPosts);
+      if (pack && !pack.failed) {
+        const { profile, items } = pack;
+        if (profile.is_private) {
+          return {
+            scraped_at: new Date().toISOString(),
+            data: { ...profile, username: u },
+            _private: true,
+            methods: ['instaloader'],
+          };
+        }
+        return buildLiveDocument(profile, items, ['instaloader', 'instagram_live']);
       }
-      return buildLiveDocument(profile, items, ['instaloader', 'instagram_live']);
+      if (pack && pack.failed) {
+        if (source === 'instaloader') {
+          const err = new Error(pack.error);
+          err.code = 'INSTALOADER_FAILED';
+          throw err;
+        }
+        // source === 'auto': fall through to tryCookies
+      } else if (source === 'instaloader') {
+        // enabled but null result should not happen; still surface a message
+        const err = new Error('Instaloader did not return profile data. Check backend/.env: USE_INSTALOADER=1, PYTHON, and session vars.');
+        err.code = 'INSTALOADER_FAILED';
+        throw err;
+      }
+    } else if (source === 'instaloader') {
+      const err = new Error('USE_INSTALOADER is not set to 1 in backend/.env (or restart the server after adding it).');
+      err.code = 'INSTALOADER_DISABLED';
+      throw err;
     }
+  }
+
+  if (!tryCookies) {
+    return null;
   }
 
   const acc = loadAccountFromEnv();
@@ -322,7 +353,13 @@ async function fetchLiveAsScrapedDoc(username, options = {}) {
   }
 
   const profile = await scrapeProfile(u, acc);
-  if (!profile) return null;
+  if (!profile) {
+    const err = new Error(
+      'Instagram returned no public profile. Usually: expired or invalid session — paste a fresh "cookie" + "x-csrftoken" from Chrome (Network tab) into backend/.env as IG_COOKIES + IG_CSRF_TOKEN, add IG_LSD (x-fb-lsd from the same request) and match IG_USER_AGENT, then restart the API. Try "Browser session only" in the UI and a known public @username.'
+    );
+    err.code = 'PROFILE_EMPTY';
+    throw err;
+  }
   if (profile.is_private) {
     return {
       scraped_at: new Date().toISOString(),

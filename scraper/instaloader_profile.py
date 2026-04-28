@@ -147,9 +147,10 @@ def main() -> int:
         emit({"ok": False, "error": f"login/session: {e!s}"})
         return 4
 
-    # Instagram often returns 401 / "wait a few minutes" while Instaloader still raises
-    # ProfileNotExistsException for every username — misleading without this check.
-    if authed:
+    # test_login() hits Instagram's "who am I" check and often fails (rate limit / checkpoint) while
+    # Profile.from_username for *public* profiles can still work. Set INSTALOADER_SKIP_TEST_LOGIN=1
+    # in .env to skip and try the fetch anyway (default: require a passing check when authed).
+    if authed and not _env_truthy("INSTALOADER_SKIP_TEST_LOGIN"):
         who = L.test_login()
         if not who:
             emit(
@@ -158,7 +159,8 @@ def main() -> int:
                     "error": (
                         "Instagram session check failed (rate limit, checkpoint, or stale cookies). "
                         "Wait several minutes, pause other scrapers, then run "
-                        "`python -m instaloader --login YOUR_USER` again or finish any IG app security prompt."
+                        "`python -m instaloader --login YOUR_USER` again or finish any IG app security prompt. "
+                        "If you are sure the session is fine, set INSTALOADER_SKIP_TEST_LOGIN=1 in scraper/.env (skips this check; public profiles may still work)."
                     ),
                 }
             )
