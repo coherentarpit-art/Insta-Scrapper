@@ -8,6 +8,7 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const fsp = require('fs/promises');
 const path = require('path');
 const https = require('https');
 const mongoose = require('mongoose');
@@ -29,6 +30,23 @@ app.use(express.json());
 /** Avoid re-reading every *_complete.json on each list request (large data/ folders) */
 const PROFILES_LIST_CACHE_MS = 30000;
 let profilesListCache = { at: 0, payload: null };
+
+/** Short-TTL cache: same user often hits /profile and /profile/.../posts back-to-back */
+const PROFILE_RESOLVE_CACHE_MS = 12000;
+const profileResolveCache = new Map();
+const MAX_PROFILE_RESOLVE_CACHE = 80;
+
+/** readdir for fuzzy file match (avoid readdirSync on every 404 path) */
+let dataDirListCache = { at: 0, stems: null };
+const DATA_DIR_LIST_CACHE_MS = 5000;
+
+/**
+ * In-memory sort cache for /posts: sorting thousands of posts per request is expensive.
+ * Key: username:sort:scraped_at
+ */
+const POSTS_SORT_CACHE_MS = 20000;
+const postSortCache = new Map();
+const MAX_POSTS_SORT_CACHE = 60;
 
 // ---------- MONGODB (optional) ----------
 
@@ -107,6 +125,26 @@ function loadProfileData(username) {
 }
 
 /**
+ * Stems of *_complete.json in data/ (with short cache).
+ */
+function getDataDirStems() {
+  const now = Date.now();
+  if (dataDirListCache.stems && now - dataDirListCache.at < DATA_DIR_LIST_CACHE_MS) {
+    return dataDirListCache.stems;
+  }
+  if (!fs.existsSync(DATA_DIR)) {
+    dataDirListCache = { at: now, stems: null };
+    return null;
+  }
+  const files = fs.readdirSync(DATA_DIR).filter((f) => f.endsWith('_complete.json'));
+  const stems = files
+    .map((f) => f.replace(/_complete\.json$/i, ''))
+    .filter(Boolean);
+  dataDirListCache = { at: now, stems };
+  return stems;
+}
+
+/**
  * If exactly one *filename* in data/ is clearly the match for a short handle (e.g. hilonicakes_complete for "hiloni")
  */
 function loadProfileDataFuzzyOrExact(username) {
@@ -116,14 +154,9 @@ function loadProfileDataFuzzyOrExact(username) {
   if (!u) return null;
   const direct = loadProfileData(u) || loadProfileData(u.toLowerCase());
   if (direct) return direct;
-  if (!fs.existsSync(DATA_DIR)) return null;
   if (u.length < 2) return null;
-  const files = fs
-    .readdirSync(DATA_DIR)
-    .filter((f) => f.endsWith('_complete.json'));
-  const stems = files
-    .map((f) => f.replace(/_complete\.json$/i, ''))
-    .filter(Boolean);
+  const stems = getDataDirStems();
+  if (!stems || stems.length === 0) return null;
   const reStart = new RegExp('^' + escapeRegex(u), 'i');
   const byPrefix = stems.filter((s) => reStart.test(s));
   if (byPrefix.length === 1) {
@@ -132,13 +165,38 @@ function loadProfileDataFuzzyOrExact(username) {
   return null;
 }
 
+function evictMapOldest(m, maxSize) {
+  if (m.size <= maxSize) return;
+  const toDrop = m.size - maxSize;
+  const iter = m.keys();
+  for (let i = 0; i < toDrop; i += 1) {
+    const k = iter.next().value;
+    if (k != null) m.delete(k);
+  }
+}
+
 /** Same shape as Mongo: full document with .data and .scraped_at */
 async function resolveProfileDocument(username) {
   const u = String(username || '').trim().replace(/^@/, '');
   if (!u) return null;
+  const now = Date.now();
+  const cacheKey = u.toLowerCase();
+  const hit = profileResolveCache.get(cacheKey);
+  if (hit && now - hit.at < PROFILE_RESOLVE_CACHE_MS) {
+    return hit.doc;
+  }
   const fromMongo = await loadProfileFromMongo(u);
-  if (fromMongo) return fromMongo;
-  return loadProfileDataFuzzyOrExact(u);
+  if (fromMongo) {
+    profileResolveCache.set(cacheKey, { at: now, doc: fromMongo });
+    evictMapOldest(profileResolveCache, MAX_PROFILE_RESOLVE_CACHE);
+    return fromMongo;
+  }
+  const fromDisk = loadProfileDataFuzzyOrExact(u);
+  if (fromDisk) {
+    profileResolveCache.set(cacheKey, { at: now, doc: fromDisk });
+    evictMapOldest(profileResolveCache, MAX_PROFILE_RESOLVE_CACHE);
+  }
+  return fromDisk;
 }
 
 function computeMedian(arr) {
@@ -148,39 +206,68 @@ function computeMedian(arr) {
   return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/** One pass over posts for four median series (avoids repeated .map/.filter on large arrays). */
+function collectEngagementSeriesForMedians(posts) {
+  const likes = [];
+  const comments = [];
+  const engagements = [];
+  const rates = [];
+  for (let i = 0; i < posts.length; i += 1) {
+    const p = posts[i];
+    const l = p.likes || 0;
+    const c = p.comments || 0;
+    likes.push(l);
+    comments.push(c);
+    engagements.push(l + c);
+    if (p.engagement_rate > 0) rates.push(p.engagement_rate);
+  }
+  return { likes, comments, engagements, rates };
+}
+
 function computeMonthlyStats(posts) {
   if (!posts || posts.length === 0) return [];
 
   const buckets = {};
-  posts.forEach(post => {
+  for (let i = 0; i < posts.length; i += 1) {
+    const post = posts[i];
     const date = new Date(post.timestamp * 1000);
     const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
     if (!buckets[key]) {
-      buckets[key] = { month: key, posts: [], totalLikes: 0, totalComments: 0, totalViews: 0, engagementRates: [] };
+      buckets[key] = {
+        month: key,
+        postCount: 0,
+        totalLikes: 0,
+        totalComments: 0,
+        totalViews: 0,
+        engagementRateSum: 0,
+        engagementRateCount: 0,
+      };
     }
-    buckets[key].posts.push(post);
-    buckets[key].totalLikes += post.likes || 0;
-    buckets[key].totalComments += post.comments || 0;
-    buckets[key].totalViews += post.views || 0;
+    const b = buckets[key];
+    b.postCount += 1;
+    b.totalLikes += post.likes || 0;
+    b.totalComments += post.comments || 0;
+    b.totalViews += post.views || 0;
     if (post.engagement_rate > 0) {
-      buckets[key].engagementRates.push(post.engagement_rate);
+      b.engagementRateSum += post.engagement_rate;
+      b.engagementRateCount += 1;
     }
-  });
+  }
 
   return Object.values(buckets)
     .sort((a, b) => a.month.localeCompare(b.month))
     .map(b => ({
       month: b.month,
       label: new Date(b.month + '-15').toLocaleDateString('en-US', { month: 'short', year: '2-digit' }),
-      post_count: b.posts.length,
+      post_count: b.postCount,
       total_likes: b.totalLikes,
       total_comments: b.totalComments,
       total_views: b.totalViews,
       total_engagements: b.totalLikes + b.totalComments,
-      avg_likes: Math.round(b.totalLikes / b.posts.length),
-      avg_comments: Math.round(b.totalComments / b.posts.length),
-      avg_engagement_rate: b.engagementRates.length > 0
-        ? parseFloat((b.engagementRates.reduce((s, r) => s + r, 0) / b.engagementRates.length).toFixed(4))
+      avg_likes: Math.round(b.totalLikes / b.postCount),
+      avg_comments: Math.round(b.totalComments / b.postCount),
+      avg_engagement_rate: b.engagementRateCount > 0
+        ? parseFloat((b.engagementRateSum / b.engagementRateCount).toFixed(4))
         : 0,
     }));
 }
@@ -263,6 +350,7 @@ function buildProfileApiPayload(scraped, options = {}) {
   const data = scraped.data;
   const posts = data.recent_posts || [];
   const metrics = data.engagement_metrics || {};
+  const med = collectEngagementSeriesForMedians(posts);
   const payload = {
     username: data.username,
     full_name: data.full_name,
@@ -274,12 +362,10 @@ function buildProfileApiPayload(scraped, options = {}) {
     bio: data.bio || '',
     engagement_metrics: {
       ...metrics,
-      median_likes: computeMedian(posts.map((p) => p.likes || 0)),
-      median_comments: computeMedian(posts.map((p) => p.comments || 0)),
-      median_engagements: computeMedian(posts.map((p) => (p.likes || 0) + (p.comments || 0))),
-      median_engagement_rate: computeMedian(
-        posts.filter((p) => p.engagement_rate > 0).map((p) => p.engagement_rate)
-      ),
+      median_likes: computeMedian(med.likes),
+      median_comments: computeMedian(med.comments),
+      median_engagements: computeMedian(med.engagements),
+      median_engagement_rate: computeMedian(med.rates),
     },
     post_types: data.post_types,
     monthly_stats: computeMonthlyStats(posts),
@@ -290,6 +376,38 @@ function buildProfileApiPayload(scraped, options = {}) {
   };
   if (options.includeRecentPosts) payload.recent_posts = posts;
   return payload;
+}
+
+/**
+ * Sort order for pagination; result is cached briefly so paging / sort toggles avoid re-sorting huge arrays.
+ */
+function getSortedPostRefs(scraped, sort) {
+  const raw = scraped.data.recent_posts || [];
+  const n = raw.length;
+  if (n <= 1) return raw;
+  const u = String(scraped.data?.username || '').toLowerCase();
+  const sa = String(scraped.scraped_at || '');
+  const key = `${u}:${sort}:${sa}`;
+  const now = Date.now();
+  const hit = postSortCache.get(key);
+  if (hit && now - hit.at < POSTS_SORT_CACHE_MS) {
+    return hit.posts;
+  }
+  const posts = raw.slice();
+  switch (sort) {
+    case 'likes':
+      posts.sort((a, b) => (b.likes || 0) - (a.likes || 0));
+      break;
+    case 'comments':
+      posts.sort((a, b) => (b.comments || 0) - (a.comments || 0));
+      break;
+    case 'date':
+    default:
+      posts.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  }
+  postSortCache.set(key, { at: now, posts });
+  evictMapOldest(postSortCache, MAX_POSTS_SORT_CACHE);
+  return posts;
 }
 
 // ---------- ROUTES ----------
@@ -455,22 +573,7 @@ app.get('/api/profile/:username/posts', async (req, res) => {
     });
   }
 
-  let posts = [...(scraped.data.recent_posts || [])];
-
-  // Sort
-  switch (sort) {
-    case 'likes':
-      posts.sort((a, b) => (b.likes || 0) - (a.likes || 0));
-      break;
-    case 'comments':
-      posts.sort((a, b) => (b.comments || 0) - (a.comments || 0));
-      break;
-    case 'date':
-    default:
-      posts.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      break;
-  }
-
+  const posts = getSortedPostRefs(scraped, sort);
   const total = posts.length;
   const paginatedPosts = posts.slice(offset, offset + size);
 
@@ -522,11 +625,14 @@ app.get('/api/profiles/db', async (req, res) => {
   }
 });
 
+/** Parallel JSON reads for /api/profiles (I/O bound; small concurrency avoids thrashing). */
+const PROFILES_READ_CONCURRENCY = 16;
+
 /**
  * GET /api/profiles
  * Lists all available scraped profiles
  */
-app.get('/api/profiles', (req, res) => {
+app.get('/api/profiles', async (req, res) => {
   const now = Date.now();
   if (profilesListCache.payload && now - profilesListCache.at < PROFILES_LIST_CACHE_MS) {
     return res.json(profilesListCache.payload);
@@ -537,26 +643,43 @@ app.get('/api/profiles', (req, res) => {
     return res.json(profilesListCache.payload);
   }
 
-  const files = fs.readdirSync(DATA_DIR)
-    .filter(f => f.endsWith('_complete.json'));
+  let files;
+  try {
+    const all = await fsp.readdir(DATA_DIR);
+    files = all.filter((f) => f.endsWith('_complete.json'));
+  } catch {
+    profilesListCache = { at: now, payload: { profiles: [] } };
+    return res.json(profilesListCache.payload);
+  }
 
-  const profiles = files.map(f => {
-    const username = f.replace('_complete.json', '');
-    try {
-      const data = loadProfileData(username);
-      return {
-        username: data?.data?.username || username,
-        full_name: data?.data?.full_name || username,
-        profile_pic: data?.data?.profile_pic || '',
-        is_verified: data?.data?.is_verified || false,
-        followers: data?.data?.followers || 0,
-        posts_available: (data?.data?.recent_posts || []).length,
-        scraped_at: data?.scraped_at || null,
-      };
-    } catch {
-      return { username, error: 'Failed to load' };
+  const profiles = [];
+  for (let i = 0; i < files.length; i += PROFILES_READ_CONCURRENCY) {
+    const batch = files.slice(i, i + PROFILES_READ_CONCURRENCY);
+    const chunk = await Promise.all(
+      batch.map(async (f) => {
+        const username = f.replace('_complete.json', '');
+        const filePath = path.join(DATA_DIR, f);
+        try {
+          const raw = await fsp.readFile(filePath, 'utf8');
+          const data = JSON.parse(raw);
+          return {
+            username: data?.data?.username || username,
+            full_name: data?.data?.full_name || username,
+            profile_pic: data?.data?.profile_pic || '',
+            is_verified: data?.data?.is_verified || false,
+            followers: data?.data?.followers || 0,
+            posts_available: (data?.data?.recent_posts || []).length,
+            scraped_at: data?.scraped_at || null,
+          };
+        } catch {
+          return { username, error: 'Failed to load' };
+        }
+      })
+    );
+    for (let j = 0; j < chunk.length; j += 1) {
+      profiles.push(chunk[j]);
     }
-  });
+  }
 
   profilesListCache = { at: now, payload: { profiles } };
   res.json(profilesListCache.payload);
